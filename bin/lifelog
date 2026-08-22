@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""lifelog -- a harness-agnostic clock for AI agents.
+
+The model has no idea what time it is, when you last spoke, or that it
+already told you to go to bed on Tuesday. This sidecar is the clock:
+
+    lifelog inject        print a temporal-context block (call at session start)
+    lifelog log "text"    append a journal line worth remembering
+    lifelog close         mark activity (safe to call repeatedly; silent)
+
+State lives in ~/.lifelog/state.json (override with $LIFELOG_HOME).
+Any harness that can run a shell command can use this -- see README.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+MAX_JOURNAL = 50
+SHOW_RECENT = 8
+
+
+def state_file() -> Path:
+    home = Path(os.environ.get("LIFELOG_HOME", str(Path.home() / ".lifelog")))
+    home.mkdir(parents=True, exist_ok=True)
+    return home / "state.json"
+
+
+def load_state() -> dict:
+    try:
+        data = json.loads(state_file().read_text())
+        if isinstance(data, dict):
+            return {"last_seen": data.get("last_seen"), "journal": data.get("journal") or []}
+    except (OSError, ValueError):
+        pass
+    return {"last_seen": None, "journal": []}
+
+
+def save_state(state: dict) -> None:
+    state["journal"] = state["journal"][-MAX_JOURNAL:]
+    fd, tmp = tempfile.mkstemp(dir=str(state_file().parent), prefix=".state-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, state_file())
+
+
+def now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def tz_name() -> str:
+    return time.tzname[time.daylight] if time.tzname else ""
+
+
+def fmt(dt: datetime) -> str:
+    return dt.strftime("%a %b %d %Y · %H:%M")
+
+
+def short(dt: datetime) -> str:
+    return dt.strftime("%a %H:%M")
+
+
+def human_gap(delta) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 0:
+        return "just now"
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return "{} min ago".format(minutes)
+    hours = minutes // 60
+    if hours < 24:
+        return "{} hour{} ago".format(hours, "" if hours == 1 else "s")
+    days = hours // 24
+    if days == 1:
+        return "yesterday"
+    if days < 14:
+        return "{} days ago".format(days)
+    weeks = days // 7
+    if weeks < 9:
+        return "{} week{} ago".format(weeks, "" if weeks == 1 else "s")
+    months = days // 30
+    return "{} months ago".format(months)
+
+
+GUIDANCE = [
+    "Max one sleep/rest suggestion per calendar day. If today's journal already records one, do not repeat it.",
+    "Weave elapsed time into responses naturally (\"we spoke three days ago\"); never re-greet a returning user as new.",
+]
+
+
+def render_block(now_dt: datetime, last_seen, entries) -> str:
+    lines = ["[lifelog] temporal context"]
+    lines.append("NOW: {} ({})".format(fmt(now_dt), tz_name()))
+    if last_seen:
+        lines.append(
+            "LAST ACTIVITY: {} — {}".format(fmt(last_seen), human_gap(now_dt - last_seen))
+        )
+    else:
+        lines.append("LAST ACTIVITY: none on record")
+    if entries:
+        lines.append("RECENT JOURNAL:")
+        for e in entries[-SHOW_RECENT:]:
+            ts = e.get("ts", "")[:16].replace("T", " ")
+            lines.append("  • {} — {}".format(ts, e.get("text", "")))
+    lines.append("GUIDANCE:")
+    for g in GUIDANCE:
+        lines.append("  - {}".format(g))
+    return "\n".join(lines)
+
+
+def cmd_inject(args) -> int:
+    state = load_state()
+    now_dt = now()
+    last_seen = None
+    if state.get("last_seen"):
+        try:
+            last_seen = datetime.fromisoformat(state["last_seen"])
+        except ValueError:
+            last_seen = None
+    print(render_block(now_dt, last_seen, state["journal"]))
+    state["last_seen"] = now_dt.isoformat(timespec="seconds")
+    save_state(state)
+    return 0
+
+
+def cmd_log(args) -> int:
+    state = load_state()
+    now_dt = now()
+    state["journal"].append({"ts": now_dt.isoformat(timespec="seconds"), "text": args.text})
+    state["last_seen"] = now_dt.isoformat(timespec="seconds")
+    save_state(state)
+    print("logged: {}".format(args.text))
+    return 0
+
+
+def cmd_close(args) -> int:
+    state = load_state()
+    state["last_seen"] = now().isoformat(timespec="seconds")
+    save_state(state)
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="lifelog", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_inject = sub.add_parser("inject", help="print temporal context; record activity")
+    p_inject.set_defaults(func=cmd_inject)
+
+    p_log = sub.add_parser("log", help="append a journal entry")
+    p_log.add_argument("text")
+    p_log.set_defaults(func=cmd_log)
+
+    p_close = sub.add_parser("close", help="silently mark activity (for stop hooks)")
+    p_close.set_defaults(func=cmd_close)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
