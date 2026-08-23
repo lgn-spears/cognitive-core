@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""lifelog -- a harness-agnostic clock for AI agents.
+"""core -- the cognitive periphery for working AI agents.
 
-The model has no idea what time it is, when you last spoke, or that it
-already told you to go to bed on Tuesday. This sidecar is the clock:
+The model is frozen; this is its notebook. One sidecar gives every harness
+on the machine a shared sense of time, a private searchable diary, a
+decisions log that preserves WHY, and open loops that resurface until done.
 
-    lifelog inject        print a temporal-context block (call at session start)
-    lifelog log "text"    append a journal line worth remembering
-    lifelog close         mark activity (safe to call repeatedly; silent)
+    core inject              print session context (call at session start)
+    core log "text"          journal entry worth remembering
+    core decision "text"     settled question + rationale, never relitigated
+    core loop add "text"     open loop; resurfaces until closed
+    core loop done "text"    close matching loops
+    core day [date]          replay one day's ledger
+    core search "query"      search all ledgers
+    core close               silently mark activity (stop hooks)
 
-State lives in ~/.lifelog/state.json (override with $LIFELOG_HOME).
-Any harness that can run a shell command can use this -- see README.
+State lives in ~/.core (override with $CORE_HOME). Any harness that can
+run a shell command can use this -- see README.
 """
 
 from __future__ import annotations
@@ -25,19 +31,39 @@ from pathlib import Path
 
 MAX_JOURNAL = 50
 SHOW_RECENT = 8
+SHOW_LOOPS = 5
+SHOW_DECISIONS = 3
+
+
+def home_dir() -> Path:
+    return Path(
+        os.environ.get("CORE_HOME")
+        or os.environ.get("LIFELOG_HOME")
+        or str(Path.home() / ".core")
+    )
 
 
 def state_file() -> Path:
-    home = Path(os.environ.get("LIFELOG_HOME", str(Path.home() / ".lifelog")))
-    home.mkdir(parents=True, exist_ok=True)
-    return home / "state.json"
+    home_dir().mkdir(parents=True, exist_ok=True)
+    return home_dir() / "state.json"
 
 
 def days_dir() -> Path:
-    home = Path(os.environ.get("LIFELOG_HOME", str(Path.home() / ".lifelog")))
-    d = home / "days"
+    d = home_dir() / "days"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def decisions_file() -> Path:
+    f = home_dir() / "decisions.log"
+    f.touch(exist_ok=True)
+    return f
+
+
+def loops_file() -> Path:
+    f = home_dir() / "loops.md"
+    f.touch(exist_ok=True)
+    return f
 
 
 def append_ledger(dt: datetime, text: str) -> None:
@@ -110,8 +136,8 @@ GUIDANCE = [
 ]
 
 
-def render_block(now_dt: datetime, last_seen, entries, today_count: int = 0) -> str:
-    lines = ["[lifelog] temporal context"]
+def render_block(now_dt: datetime, last_seen, entries, today_count: int = 0, loops=None, decisions=None) -> str:
+    lines = ["[core] session context"]
     lines.append("NOW: {} ({})".format(fmt(now_dt), tz_name()))
     if last_seen:
         lines.append(
@@ -119,21 +145,45 @@ def render_block(now_dt: datetime, last_seen, entries, today_count: int = 0) -> 
         )
     else:
         lines.append("LAST ACTIVITY: none on record")
+
+    for text, opened in (loops or [])[:SHOW_LOOPS]:
+        lines.append("OPEN LOOP (surface; do not silently drop): {} — {}".format(text, opened))
+
+    for line in (decisions or [])[-SHOW_DECISIONS:]:
+        lines.append("SETTLED — do not relitigate: {}".format(line))
+
     if entries:
         lines.append("RECENT JOURNAL:")
         for e in entries[-SHOW_RECENT:]:
             ts = e.get("ts", "")[:16].replace("T", " ")
             lines.append("  • {} — {}".format(ts, e.get("text", "")))
+
     lines.append(
-        "MEMORY: today has {} ledger entr{}. Full history is private & searchable:".format(
+        "MEMORY: today has {} ledger entr{}; full history is private & searchable:".format(
             today_count, "y" if today_count == 1 else "ies"
         )
     )
-    lines.append('  - `lifelog day` (today) · `lifelog day 2026-08-01` · `lifelog search "<query>"`')
+    lines.append('  - `core day` (today) · `core day YYYY-MM-DD` · `core search "<query>"`')
     lines.append("GUIDANCE:")
     for g in GUIDANCE:
         lines.append("  - {}".format(g))
     return "\n".join(lines)
+
+
+def open_loops():
+    """Unclosed loops as (text, opened_date), oldest first."""
+    out = []
+    for line in loops_file().read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- [ ]"):
+            body = stripped[5:].strip()
+            date, _, text = body.partition(" ")
+            out.append((text or body, date))
+    return out
+
+
+def recent_decisions():
+    return [ln for ln in decisions_file().read_text().splitlines() if ln.strip()]
 
 
 def count_today(now_dt: datetime) -> int:
@@ -154,9 +204,21 @@ def cmd_inject(args) -> int:
             last_seen = datetime.fromisoformat(state["last_seen"])
         except ValueError:
             last_seen = None
-    print(render_block(now_dt, last_seen, state["journal"], count_today(now_dt)))
+    print(render_block(
+        now_dt, last_seen, state["journal"], count_today(now_dt),
+        loops=open_loops(), decisions=recent_decisions(),
+    ))
     state["last_seen"] = now_dt.isoformat(timespec="seconds")
     save_state(state)
+    return 0
+
+
+def cmd_decision(args) -> int:
+    stamp = now().strftime("%Y-%m-%d")
+    with decisions_file().open("a") as f:
+        f.write("[{}] {}\n".format(stamp, args.text))
+    append_ledger(now(), "decision: " + args.text)
+    print("recorded: {}".format(args.text))
     return 0
 
 
@@ -168,6 +230,41 @@ def cmd_log(args) -> int:
     save_state(state)
     append_ledger(now_dt, "note: " + args.text)
     print("logged: {}".format(args.text))
+    return 0
+
+
+def cmd_loop(args) -> int:
+    now_dt = now()
+    if args.loop_cmd == "add":
+        entry = "- [ ] {} {}".format(
+            args.due or now_dt.strftime("%Y-%m-%d"), args.text
+        )
+        with loops_file().open("a") as f:
+            f.write(entry + "\n")
+        append_ledger(now_dt, "loop opened: " + args.text)
+        print("loop opened: {}".format(args.text))
+        return 0
+    if args.loop_cmd == "done":
+        lines = loops_file().read_text().splitlines()
+        closed, out = 0, []
+        needle = args.text.lower()
+        for line in lines:
+            low = line.lower()
+            if line.strip().startswith("- [ ]") and needle in low:
+                out.append(line.replace("- [ ]", "- [x]", 1) + " (closed {})".format(now_dt.strftime("%Y-%m-%d")))
+                closed += 1
+            else:
+                out.append(line)
+        loops_file().write_text("\n".join(out) + ("\n" if out else ""))
+        append_ledger(now_dt, "loop closed: " + args.text)
+        print("{} loop(s) closed".format(closed))
+        return 0
+    # list
+    loops = open_loops()
+    if not loops:
+        print("no open loops")
+    for text, opened in loops:
+        print("[{}] {}".format(opened, text))
     return 0
 
 
@@ -213,15 +310,25 @@ def cmd_search(args) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="lifelog", description=__doc__)
+    parser = argparse.ArgumentParser(prog="core", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_inject = sub.add_parser("inject", help="print temporal context; record activity")
+    p_inject = sub.add_parser("inject", help="print session context; record activity")
     p_inject.set_defaults(func=cmd_inject)
 
     p_log = sub.add_parser("log", help="append a journal entry")
     p_log.add_argument("text")
     p_log.set_defaults(func=cmd_log)
+
+    p_dec = sub.add_parser("decision", help="record a settled decision + rationale")
+    p_dec.add_argument("text")
+    p_dec.set_defaults(func=cmd_decision)
+
+    p_loop = sub.add_parser("loop", help="prospective memory: add / done / list")
+    p_loop.add_argument("loop_cmd", choices=["add", "done", "list"])
+    p_loop.add_argument("text", nargs="?", default="")
+    p_loop.add_argument("--due", help="optional due date YYYY-MM-DD")
+    p_loop.set_defaults(func=cmd_loop)
 
     p_close = sub.add_parser("close", help="silently mark activity (for stop hooks)")
     p_close.set_defaults(func=cmd_close)

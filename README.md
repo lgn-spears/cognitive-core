@@ -1,131 +1,93 @@
-# lifelog
+# cognitive core
 
-**A clock for AI agents — because the model has no idea what time it is, when you last spoke, or that it already told you to go to bed on Tuesday.**
+**The memory half of the cognitive core: one local sidecar gives every AI harness on your machine a shared clock, a private searchable diary of what it did, a decisions log that preserves WHY, and open loops that resurface until done.**
 
-LLMs are stateless: every session arrives knowing nothing except what's in
-context. Harnesses inject dates sometimes, but nothing tracks *elapsed* time,
-*recurrence* of advice, or your actual rhythm across days. So agents nag you
-about sleep fresh every night and re-greet you like strangers after lunch.
+LLMs are stateless geniuses with no watch. Every session starts from zero:
+your agent doesn't know it's 2am, that you spoke yesterday, that it already
+told you to sleep, or that "we decided this on the 12th." Karpathy's answer
+is a slim reasoning model with knowledge living *outside* its weights —
+user-owned files instead of vendor lock-in. This repo ships that periphery,
+today, for working agents.
 
-lifelog is a **sidecar**: one tiny zero-dependency script holding a small
-journal of time + activity. Any agent harness that can run a shell command can
-read from it and write to it.
-
-## The sidecar principle
-
-You probably run more than one AI harness. lifelog doesn't care:
+Zero dependencies. No network. No daemon. Nothing leaves your machine.
 
 ```
                     ┌──────────────────┐
    Claude Code ────▶│                  │
-   opencode ───────▶│  ~/.lifelog/     │  one shared clock,
-   Cursor ─────────▶│  state.json      │  one shared journal
-   anything else ──▶│                  │
+   opencode ───────▶│    ~/.core/      │  one shared clock,
+   Cursor ─────────▶│  plain markdown  │  one shared journal,
+   anything else ──▶│                  │  all your agents
                     └──────────────────┘
-                     via bin/lifelog
+                     via bin/core
 ```
-
-Each harness adds exactly two lines of plumbing:
-
-1. **Session start:** run `lifelog inject` → its output becomes context
-2. **Session end:** run `lifelog close` → silently marks activity
 
 ## Install
 
 ```bash
-git clone https://github.com/lgn-spears/lifelog && cd lifelog
-ln -sf "$PWD/bin/lifelog" ~/.local/bin/lifelog   # anywhere on PATH works
-lifelog inject                                    # first block prints
+git clone https://github.com/lgn-spears/cognitive-core && cd cognitive-core
+ln -sf "$PWD/bin/core" ~/.local/bin/core
+core inject        # first session block prints
 ```
 
-Requires only Python 3.9+. No packages, no network, no daemons.
+Python 3.9+ only.
 
-## Wiring it into YOUR harness
+## Wire it into your harness (2 lines)
 
 **Claude Code** (`~/.claude/settings.json`):
 
 ```json
 "hooks": {
-  "SessionStart": [{ "hooks": [{ "type": "command", "command": "/path/to/lifelog inject", "timeout": 10 }] }],
-  "Stop":         [{ "hooks": [{ "type": "command", "command": "/path/to/lifelog close", "timeout": 10 }] }]
+  "SessionStart": [{ "hooks": [{ "type": "command", "command": "/path/to/core inject", "timeout": 10 }] }],
+  "Stop":         [{ "hooks": [{ "type": "command", "command": "/path/to/core close", "timeout": 10 }] }]
 }
 ```
 
-Session-start stdout is injected into context automatically; `close` on Stop
-keeps the clock fresh between conversations.
-
-**Any harness with an instructions file** (opencode AGENTS.md, Cursor rules,
-system prompts): paste this —
+**Any instructions file** (opencode AGENTS.md, Cursor rules, system prompt):
 
 ```
-At session start, run `lifelog inject` and treat its output as authoritative
-time context. When you give recurring life-advice (sleep, breaks), first check
-the journal; if already given today, do not repeat. Record notable advice in
-the journal by running: lifelog log "<what you said>"
+At session start run `core inject` and treat its output as authoritative
+context. Before repeating life-advice, check today's ledger. Record notable
+advice via `core log "<what was said>"`. When a question gets settled, run
+`core decision "<choice> — <why>"`. When you promise something later, open
+it with `core loop add "<promise>"`.
 ```
-
-That's the whole integration. The model stays frozen; the state lives outside.
 
 ## Commands
 
 | command | does |
 |---|---|
-| `lifelog inject` | print `[lifelog] temporal context` block; record activity |
-| `lifelog log "text"` | append a timestamped journal line |
-| `lifelog close` | silently record activity (for stop hooks) |
-| `lifelog day [date]` | print one day's full ledger (default: today) |
-| `lifelog search "query"` | search every day's ledger, oldest to newest |
-| `lifelog day [date]` | print one day's full ledger |
-| `lifelog search "query"` | search every day, newest to oldest |
+| `core inject` | print session context; record activity |
+| `core log "text"` | journal entry worth remembering |
+| `core decision "chose X — because Y"` | settled; resurfaces as SETTLED forever |
+| `core loop add "promise"` / `done` / list | prospective memory |
+| `core day [date]` | replay one day's full ledger |
+| `core search "query"` | search every day's ledger |
+| `core close` | silently mark activity (stop hooks) |
 
-State: `~/.lifelog/state.json` · override dir with `$LIFELOG_HOME`.
-Journal keeps the last 50 entries; blocks show the most recent 8.
+State: `~/.core/` · override dir with `$CORE_HOME`. Ledgers keep themselves;
+journal holds the last 50 notes.
 
-## What the injected block looks like
+## What a session sees
 
 ```
-[lifelog] temporal context
-NOW: Sat Aug 22 2026 · 15:06 (EDT)
-LAST ACTIVITY: Wed Aug 19 2026 · 13:15 — 3 days ago
+[core] session context
+NOW: Sun Aug 23 2026 · 13:20 (EDT)
+LAST ACTIVITY: Sat Aug 22 2026 · 16:00 — yesterday
+OPEN LOOP (surface; do not silently drop): fix CI before Friday demo — 2026-08-22
+SETTLED — do not relitigate: [2026-08-23] SQLite over Postgres — zero-admin single file
 RECENT JOURNAL:
-  • 2026-08-19 01:10 — told Logan to sleep; he kept working
+  • 2026-08-23 13:10 — worked on harness-cl from opencode
+MEMORY: today has 3 ledger entries; full history is private & searchable:
+  - `core day` · `core day YYYY-MM-DD` · `core search "<query>"`
 GUIDANCE:
-  - Max one sleep/rest suggestion per calendar day. If today's journal
-    already records one, do not repeat it.
-  - Weave elapsed time into responses naturally ("we spoke three days ago");
-    never re-greet a returning user as new.
+  - Max one sleep/rest suggestion per calendar day...
 ```
 
-## Design notes
+## Why these choices
 
-- **The guidance lines are harness state, not model behavior.** The dedup rule
-  ("one sleep suggestion per day") works because it sits in front of a frozen
-  model every session — the same trick this repo author's `harness-cl` project
-  studies formally.
-- Journal entries are plain text the *agent* writes about *itself* — a tiny
-  Experience Memory. Poisoning it would poison behavior; see `harness-cl` for
-  why that matters.
-- Everything is deterministic and local. Nothing leaves your machine.
-
-## Long-term memory (v0.2)
-
-Every session start writes a line to `~/.lifelog/days/YYYY-MM-DD.log`; agents
-add notes as they go. The result is a private, searchable diary of what your
-agents did — across sessions, across harnesses, across days:
-
-```
-$ lifelog search "auth regression"
-=== 2026-08-21 ===
-[10:00] note: fixed auth bug
-=== 2026-08-22 ===
-[23:00] note: auth regression appeared
-
-2 match(es) across the ledger.
-```
-
-Plain text, grep-speed, zero infrastructure. Private by construction: it's
-just files on your disk. The injected block stays small and tells the agent
-the archive exists (`lifelog day`, `lifelog search`) so deep history is
-pulled on demand instead of stuffed into every prompt.
+Seven laws distilled from ~30 memory systems, papers, and practitioner
+post-mortems — map + territory, append-and-supersede, gated semantic writes,
+boring formats, preserve WHY, staleness kills, structural trust. Full
+reasoning in [DESIGN.md](DESIGN.md).
 
 MIT.

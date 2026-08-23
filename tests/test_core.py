@@ -6,16 +6,16 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-LIFELOG = Path(__file__).resolve().parents[1] / "bin" / "lifelog"
+LIFELOG = Path(__file__).resolve().parents[1] / "bin" / "core"
 sys.path.insert(0, str(LIFELOG.parent))
 
 import importlib.util
 from importlib.machinery import SourceFileLoader
 
-loader = SourceFileLoader("lifelog", str(LIFELOG))
-spec = importlib.util.spec_from_loader("lifelog", loader)
-lifelog = importlib.util.module_from_spec(spec)
-loader.exec_module(lifelog)
+loader = SourceFileLoader("core", str(LIFELOG))
+spec = importlib.util.spec_from_loader("core", loader)
+core_mod = importlib.util.module_from_spec(spec)
+loader.exec_module(core_mod)
 
 
 def test_gap_vocabulary():
@@ -30,15 +30,15 @@ def test_gap_vocabulary():
         (timedelta(days=21), "3 weeks ago"),
     ]
     for delta, expected in cases:
-        assert lifelog.human_gap(delta) == expected
+        assert core_mod.human_gap(delta) == expected
 
 
 def test_negative_gap_clamped():
-    assert lifelog.human_gap(timedelta(hours=-3)) == "just now"
+    assert core_mod.human_gap(timedelta(hours=-3)) == "just now"
 
 
 def test_block_mentions_sleep_rule_once():
-    block = lifelog.render_block(
+    block = core_mod.render_block(
         datetime(2026, 8, 22, 23, 40), None, []
     )
     assert block.count("sleep/rest suggestion") == 1
@@ -49,21 +49,21 @@ def test_block_shows_last_activity_and_journal_tail():
     now = datetime(2026, 8, 22, 23, 40)
     last = now - timedelta(days=3)
     entries = [{"ts": "2026-08-19T01:10:00", "text": "told Logan to sleep; he kept working"}]
-    block = lifelog.render_block(now, last, entries)
+    block = core_mod.render_block(now, last, entries)
     assert "LAST ACTIVITY" in block and "3 days ago" in block
     assert "told Logan to sleep" in block
 
 
 def test_journal_rotates_to_cap():
     state = {"last_seen": None, "journal": [{"ts": str(i), "text": "e"} for i in range(80)]}
-    lifelog.state_file = lambda: Path("/tmp/never-used")  # not touched by save below
+    core_mod.state_file = lambda: Path("/tmp/never-used")  # not touched by save below
     # emulate the rotation save_state performs:
-    state["journal"] = state["journal"][-lifelog.MAX_JOURNAL:]
-    assert len(state["journal"]) == lifelog.MAX_JOURNAL
+    state["journal"] = state["journal"][-core_mod.MAX_JOURNAL:]
+    assert len(state["journal"]) == core_mod.MAX_JOURNAL
 
 
 def roundtrip(tmp_home: Path, *args):
-    env = {"PATH": "/usr/bin:/bin", "LIFELOG_HOME": str(tmp_home), "HOME": str(tmp_home)}
+    env = {"PATH": "/usr/bin:/bin", "CORE_HOME": str(tmp_home), "HOME": str(tmp_home)}
     return subprocess.run(
         [sys.executable, str(LIFELOG), *args], capture_output=True, text=True, env=env
     )
@@ -105,7 +105,7 @@ def test_search_spans_days(tmp_path):
     (days / "2026-08-21.log").write_text("[09:00] session start (work)\n[10:00] note: fixed auth bug\n")
     (days / "2026-08-22.log").write_text("[23:00] note: auth regression appeared\n")
 
-    env = dict(os.environ, LIFELOG_HOME=str(env_home))
+    env = dict(os.environ, CORE_HOME=str(env_home))
     result = subprocess.run(
         [sys.executable, str(LIFELOG), "search", "auth"],
         capture_output=True, text=True, env=env,
@@ -124,7 +124,7 @@ def test_day_command_scopes_to_date(tmp_path):
     days.mkdir(parents=True)
     (days / "2026-08-01.log").write_text("[08:00] old day\n")
 
-    env = dict(os.environ, LIFELOG_HOME=str(tmp_path))
+    env = dict(os.environ, CORE_HOME=str(tmp_path))
     hit = subprocess.run(
         [sys.executable, str(LIFELOG), "day", "2026-08-01"],
         capture_output=True, text=True, env=env,
