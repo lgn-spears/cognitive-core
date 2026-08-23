@@ -81,7 +81,57 @@ def test_cli_roundtrip(tmp_path):
     assert "none on record" not in out          # last activity now exists
     assert "suggested a break" in out           # journal surfaced
     assert "just now" in out or "min ago" in out
+    assert "MEMORY:" in out                     # searchable-memory pointer injected
 
     state = json.loads((tmp_path / "state.json").read_text())
     assert state["last_seen"] is not None
     assert state["journal"][0]["text"] == "suggested a break"
+
+    # v0.2: inject wrote a session-start line into today's ledger
+    days = tmp_path / "days"
+    pages = list(days.glob("*.log"))
+    assert len(pages) == 1
+    assert "session start" in pages[0].read_text()
+
+
+def test_search_spans_days(tmp_path):
+    import os
+    from datetime import datetime
+
+    env_home = tmp_path
+    env_home.mkdir(exist_ok=True)
+    days = env_home / "days"
+    days.mkdir()
+    (days / "2026-08-21.log").write_text("[09:00] session start (work)\n[10:00] note: fixed auth bug\n")
+    (days / "2026-08-22.log").write_text("[23:00] note: auth regression appeared\n")
+
+    env = dict(os.environ, LIFELOG_HOME=str(env_home))
+    result = subprocess.run(
+        [sys.executable, str(LIFELOG), "search", "auth"],
+        capture_output=True, text=True, env=env,
+    )
+    assert "2026-08-21" in result.stdout
+    assert "2026-08-22" in result.stdout
+    assert "fixed auth bug" in result.stdout
+    assert "auth regression" in result.stdout
+    assert "2 match(es)" in result.stdout
+
+
+def test_day_command_scopes_to_date(tmp_path):
+    import os
+
+    days = tmp_path / "days"
+    days.mkdir(parents=True)
+    (days / "2026-08-01.log").write_text("[08:00] old day\n")
+
+    env = dict(os.environ, LIFELOG_HOME=str(tmp_path))
+    hit = subprocess.run(
+        [sys.executable, str(LIFELOG), "day", "2026-08-01"],
+        capture_output=True, text=True, env=env,
+    )
+    miss = subprocess.run(
+        [sys.executable, str(LIFELOG), "day", "2026-07-31"],
+        capture_output=True, text=True, env=env,
+    )
+    assert "old day" in hit.stdout
+    assert "no ledger" in miss.stdout

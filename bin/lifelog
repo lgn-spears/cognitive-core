@@ -33,6 +33,20 @@ def state_file() -> Path:
     return home / "state.json"
 
 
+def days_dir() -> Path:
+    home = Path(os.environ.get("LIFELOG_HOME", str(Path.home() / ".lifelog")))
+    d = home / "days"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def append_ledger(dt: datetime, text: str) -> None:
+    """One plain-text page per day: days/YYYY-MM-DD.log"""
+    page = days_dir() / (dt.strftime("%Y-%m-%d") + ".log")
+    with page.open("a") as f:
+        f.write("[{}] {}\n".format(dt.strftime("%H:%M"), text))
+
+
 def load_state() -> dict:
     try:
         data = json.loads(state_file().read_text())
@@ -96,7 +110,7 @@ GUIDANCE = [
 ]
 
 
-def render_block(now_dt: datetime, last_seen, entries) -> str:
+def render_block(now_dt: datetime, last_seen, entries, today_count: int = 0) -> str:
     lines = ["[lifelog] temporal context"]
     lines.append("NOW: {} ({})".format(fmt(now_dt), tz_name()))
     if last_seen:
@@ -110,22 +124,37 @@ def render_block(now_dt: datetime, last_seen, entries) -> str:
         for e in entries[-SHOW_RECENT:]:
             ts = e.get("ts", "")[:16].replace("T", " ")
             lines.append("  • {} — {}".format(ts, e.get("text", "")))
+    lines.append(
+        "MEMORY: today has {} ledger entr{}. Full history is private & searchable:".format(
+            today_count, "y" if today_count == 1 else "ies"
+        )
+    )
+    lines.append('  - `lifelog day` (today) · `lifelog day 2026-08-01` · `lifelog search "<query>"`')
     lines.append("GUIDANCE:")
     for g in GUIDANCE:
         lines.append("  - {}".format(g))
     return "\n".join(lines)
 
 
+def count_today(now_dt: datetime) -> int:
+    page = days_dir() / (now_dt.strftime("%Y-%m-%d") + ".log")
+    try:
+        return sum(1 for line in page.read_text().splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
 def cmd_inject(args) -> int:
     state = load_state()
     now_dt = now()
+    append_ledger(now_dt, "session start ({})".format(Path.cwd().name or "unknown dir"))
     last_seen = None
     if state.get("last_seen"):
         try:
             last_seen = datetime.fromisoformat(state["last_seen"])
         except ValueError:
             last_seen = None
-    print(render_block(now_dt, last_seen, state["journal"]))
+    print(render_block(now_dt, last_seen, state["journal"], count_today(now_dt)))
     state["last_seen"] = now_dt.isoformat(timespec="seconds")
     save_state(state)
     return 0
@@ -137,6 +166,7 @@ def cmd_log(args) -> int:
     state["journal"].append({"ts": now_dt.isoformat(timespec="seconds"), "text": args.text})
     state["last_seen"] = now_dt.isoformat(timespec="seconds")
     save_state(state)
+    append_ledger(now_dt, "note: " + args.text)
     print("logged: {}".format(args.text))
     return 0
 
@@ -145,6 +175,40 @@ def cmd_close(args) -> int:
     state = load_state()
     state["last_seen"] = now().isoformat(timespec="seconds")
     save_state(state)
+    return 0
+
+
+def cmd_day(args) -> int:
+    target = args.date or now().strftime("%Y-%m-%d")
+    page = days_dir() / (target + ".log")
+    try:
+        text = page.read_text()
+    except OSError:
+        print("no ledger for {}".format(target))
+        return 1
+    print("=== {} ===".format(target))
+    print(text, end="")
+    return 0
+
+
+def cmd_search(args) -> int:
+    needle = args.query.lower()
+    hits = 0
+    for page in sorted(days_dir().glob("*.log")):
+        try:
+            lines = page.read_text().splitlines()
+        except OSError:
+            continue
+        matched = [ln for ln in lines if needle in ln.lower()]
+        if matched:
+            print("=== {} ===".format(page.stem))
+            for ln in matched:
+                print(ln)
+            hits += len(matched)
+    if not hits:
+        print("no matches for {!r}".format(args.query))
+    else:
+        print("\n{} match(es) across the ledger.".format(hits))
     return 0
 
 
@@ -161,6 +225,14 @@ def main(argv=None) -> int:
 
     p_close = sub.add_parser("close", help="silently mark activity (for stop hooks)")
     p_close.set_defaults(func=cmd_close)
+
+    p_day = sub.add_parser("day", help="print one day's ledger (default: today)")
+    p_day.add_argument("date", nargs="?", help="YYYY-MM-DD")
+    p_day.set_defaults(func=cmd_day)
+
+    p_search = sub.add_parser("search", help="search all ledgers, newest to oldest")
+    p_search.add_argument("query")
+    p_search.set_defaults(func=cmd_search)
 
     args = parser.parse_args(argv)
     return args.func(args)

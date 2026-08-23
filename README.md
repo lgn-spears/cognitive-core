@@ -73,6 +73,8 @@ That's the whole integration. The model stays frozen; the state lives outside.
 | `lifelog inject` | print `[lifelog] temporal context` block; record activity |
 | `lifelog log "text"` | append a timestamped journal line |
 | `lifelog close` | silently record activity (for stop hooks) |
+| `lifelog day [date]` | print one day's full ledger |
+| `lifelog search "query"` | search every day, newest to oldest |
 
 State: `~/.lifelog/state.json` · override dir with `$LIFELOG_HOME`.
 Journal keeps the last 50 entries; blocks show the most recent 8.
