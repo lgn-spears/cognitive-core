@@ -73,6 +73,8 @@ That's the whole integration. The model stays frozen; the state lives outside.
 | `lifelog inject` | print `[lifelog] temporal context` block; record activity |
 | `lifelog log "text"` | append a timestamped journal line |
 | `lifelog close` | silently record activity (for stop hooks) |
+| `lifelog day [date]` | print one day's full ledger (default: today) |
+| `lifelog search "query"` | search every day's ledger, oldest to newest |
 | `lifelog day [date]` | print one day's full ledger |
 | `lifelog search "query"` | search every day, newest to oldest |
 
@@ -104,5 +106,26 @@ GUIDANCE:
   Experience Memory. Poisoning it would poison behavior; see `harness-cl` for
   why that matters.
 - Everything is deterministic and local. Nothing leaves your machine.
+
+## Long-term memory (v0.2)
+
+Every session start writes a line to `~/.lifelog/days/YYYY-MM-DD.log`; agents
+add notes as they go. The result is a private, searchable diary of what your
+agents did — across sessions, across harnesses, across days:
+
+```
+$ lifelog search "auth regression"
+=== 2026-08-21 ===
+[10:00] note: fixed auth bug
+=== 2026-08-22 ===
+[23:00] note: auth regression appeared
+
+2 match(es) across the ledger.
+```
+
+Plain text, grep-speed, zero infrastructure. Private by construction: it's
+just files on your disk. The injected block stays small and tells the agent
+the archive exists (`lifelog day`, `lifelog search`) so deep history is
+pulled on demand instead of stuffed into every prompt.
 
 MIT.
