@@ -6,13 +6,13 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-LIFELOG = Path(__file__).resolve().parents[1] / "bin" / "core"
-sys.path.insert(0, str(LIFELOG.parent))
+CORE = Path(__file__).resolve().parents[1] / "bin" / "core"
+sys.path.insert(0, str(CORE.parent))
 
 import importlib.util
 from importlib.machinery import SourceFileLoader
 
-loader = SourceFileLoader("core", str(LIFELOG))
+loader = SourceFileLoader("core", str(CORE))
 spec = importlib.util.spec_from_loader("core", loader)
 core_mod = importlib.util.module_from_spec(spec)
 loader.exec_module(core_mod)
@@ -65,7 +65,7 @@ def test_journal_rotates_to_cap():
 def roundtrip(tmp_home: Path, *args):
     env = {"PATH": "/usr/bin:/bin", "CORE_HOME": str(tmp_home), "HOME": str(tmp_home)}
     return subprocess.run(
-        [sys.executable, str(LIFELOG), *args], capture_output=True, text=True, env=env
+        [sys.executable, str(CORE), *args], capture_output=True, text=True, env=env
     )
 
 
@@ -107,7 +107,7 @@ def test_search_spans_days(tmp_path):
 
     env = dict(os.environ, CORE_HOME=str(env_home))
     result = subprocess.run(
-        [sys.executable, str(LIFELOG), "search", "auth"],
+        [sys.executable, str(CORE), "search", "auth"],
         capture_output=True, text=True, env=env,
     )
     assert "2026-08-21" in result.stdout
@@ -126,12 +126,39 @@ def test_day_command_scopes_to_date(tmp_path):
 
     env = dict(os.environ, CORE_HOME=str(tmp_path))
     hit = subprocess.run(
-        [sys.executable, str(LIFELOG), "day", "2026-08-01"],
+        [sys.executable, str(CORE), "day", "2026-08-01"],
         capture_output=True, text=True, env=env,
     )
     miss = subprocess.run(
-        [sys.executable, str(LIFELOG), "day", "2026-07-31"],
+        [sys.executable, str(CORE), "day", "2026-07-31"],
         capture_output=True, text=True, env=env,
     )
     assert "old day" in hit.stdout
     assert "no ledger" in miss.stdout
+
+
+def test_doctor_flags_overdue_loops(tmp_path):
+    import os
+    days = tmp_path / "days"
+    days.mkdir(parents=True)
+    (tmp_path / "loops.md").write_text("- [ ] 2026-08-01 fix the CI\n")
+    env = dict(os.environ, CORE_HOME=str(tmp_path))
+    result = subprocess.run(
+        [sys.executable, str(CORE), "doctor"],
+        capture_output=True, text=True, env=env,
+    )
+    assert "OVERDUE" in result.stdout
+    assert result.returncode == 1
+
+
+def test_doctor_clean_store_passes(tmp_path):
+    import os
+    roundtrip(tmp_path, "inject")  # initialize store so state.json exists
+    (tmp_path / "loops.md").write_text("")
+    env = dict(os.environ, CORE_HOME=str(tmp_path))
+    result = subprocess.run(
+        [sys.executable, str(CORE), "doctor"],
+        capture_output=True, text=True, env=env,
+    )
+    assert "healthy" in result.stdout
+    assert result.returncode == 0

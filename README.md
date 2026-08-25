@@ -25,8 +25,8 @@ Zero dependencies. No network. No daemon. Nothing leaves your machine.
 
 ```bash
 git clone https://github.com/lgn-spears/cognitive-core && cd cognitive-core
-ln -sf "$PWD/bin/core" ~/.local/bin/core
-core inject        # first session block prints
+./install.sh        # symlinks bin + installs the Claude Code skill
+core inject         # first session block prints
 ```
 
 Python 3.9+ only.
@@ -62,7 +62,26 @@ it with `core loop add "<promise>"`.
 | `core loop add "promise"` / `done` / list | prospective memory |
 | `core day [date]` | replay one day's full ledger |
 | `core search "query"` | search every day's ledger |
+| `core doctor` | health check: overdue loops, stale file references |
 | `core close` | silently mark activity (stop hooks) |
+
+## Standing orders
+
+Edit `~/.core/CORE.md` — one rule per line, your voice. Its contents are
+injected verbatim into every session, on every harness:
+
+```
+Never suggest meetings before 10am.
+I ship Thursdays; don't schedule deploys Friday.
+Explain trade-offs in plain English before showing code.
+```
+
+## Install as an Agent Skill
+
+`./install.sh` also links `skill/` into `~/.claude/skills/cognitive-core`,
+teaching Claude Code *when* to write decisions, open loops, and journal
+notes — the write discipline that makes the memory actually fill up.
+Works with any SKILL.md-compatible harness.
 
 State: `~/.core/` · override dir with `$CORE_HOME`. Ledgers keep themselves;
 journal holds the last 50 notes.

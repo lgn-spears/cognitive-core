@@ -74,8 +74,8 @@ your brain"). We ship the second bet, today, without waiting for the first.
 
 ## Roadmap
 
-- v0.4: CORE.md standing-orders file; hash-chained tamper-evident ledgers
-  (provenance per entry); `core doctor` staleness lint (dead-path detection)
+- v0.4: ~~standing orders~~ shipped · hash-chained tamper-evident ledgers
+  `core doctor` staleness lint — SHIPPED. Remaining: provenance chain
 - v0.5: rhythm stats (active-hours inference); weekly synthesis pages
 - Later: optional wiki/ layer per Karpathy KB spec; qmd-style hybrid search
   escape hatch past ~500 docs; multi-machine via git-backed state

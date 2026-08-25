@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -64,6 +65,18 @@ def loops_file() -> Path:
     f = home_dir() / "loops.md"
     f.touch(exist_ok=True)
     return f
+
+
+def orders_file() -> Path:
+    return home_dir() / "CORE.md"
+
+
+def standing_orders(limit: int = 40):
+    """User-authored standing rules, injected verbatim. Their file, their voice."""
+    try:
+        return [ln.rstrip() for ln in orders_file().read_text().splitlines() if ln.strip()][:limit]
+    except OSError:
+        return []
 
 
 def append_ledger(dt: datetime, text: str) -> None:
@@ -136,7 +149,7 @@ GUIDANCE = [
 ]
 
 
-def render_block(now_dt: datetime, last_seen, entries, today_count: int = 0, loops=None, decisions=None) -> str:
+def render_block(now_dt: datetime, last_seen, entries, today_count: int = 0, loops=None, decisions=None, orders=None) -> str:
     lines = ["[core] session context"]
     lines.append("NOW: {} ({})".format(fmt(now_dt), tz_name()))
     if last_seen:
@@ -151,6 +164,12 @@ def render_block(now_dt: datetime, last_seen, entries, today_count: int = 0, loo
 
     for line in (decisions or [])[-SHOW_DECISIONS:]:
         lines.append("SETTLED — do not relitigate: {}".format(line))
+
+    orders = orders or []
+    if orders:
+        lines.append("STANDING ORDERS (from CORE.md, user-authored — obey):")
+        for ln in orders:
+            lines.append("  {}".format(ln))
 
     if entries:
         lines.append("RECENT JOURNAL:")
@@ -206,7 +225,7 @@ def cmd_inject(args) -> int:
             last_seen = None
     print(render_block(
         now_dt, last_seen, state["journal"], count_today(now_dt),
-        loops=open_loops(), decisions=recent_decisions(),
+        loops=open_loops(), decisions=recent_decisions(), orders=standing_orders(),
     ))
     state["last_seen"] = now_dt.isoformat(timespec="seconds")
     save_state(state)
@@ -309,6 +328,75 @@ def cmd_search(args) -> int:
     return 0
 
 
+PATH_RE = re.compile(r"(?:~/|/Users/\S+/|\./)?[\w.-]+(?:/[\w.-]+)*\.(?:py|md|json|log|toml|txt|sh|js|ts)")
+
+
+def doctor_report(now_dt: datetime) -> tuple:
+    """Pure-ish health check: (issues, notes). Filesystem probes allowed."""
+    issues, notes = [], []
+
+    # 1. overdue open loops
+    for line in loops_file().read_text().splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- [ ]"):
+            continue
+        parts = stripped[5:].strip().split(" ", 1)
+        try:
+            due = datetime.strptime(parts[0], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        text = parts[1] if len(parts) > 1 else "(loop)"
+        age_days = (now_dt.date() - due).days
+        if age_days > 0:
+            issues.append("OVERDUE loop ({} days past {}): {}".format(age_days, parts[0], text))
+
+    # 2. stale file references anywhere in the ledger history
+    seen_paths, missing = set(), []
+    pages = sorted(days_dir().glob("*.log"))
+    for page in pages:
+        try:
+            content = page.read_text()
+        except OSError:
+            continue
+        for m in PATH_RE.finditer(content):
+            raw = m.group(0)
+            expanded = Path(os.path.expanduser(raw))
+            if raw not in seen_paths and not expanded.exists():
+                # ignore our own day-ledger mentions of the state dir pattern
+                if "days/" in raw or raw.endswith(".log"):
+                    continue
+                seen_paths.add(raw)
+                missing.append((page.stem, raw))
+    for where, path in missing[:10]:
+        issues.append("STALE REFERENCE in {} ledger: {} no longer exists".format(where, path))
+    if len(missing) > 10:
+        notes.append("{} more stale references not shown".format(len(missing) - 10))
+
+    # 3. store basics
+    if not state_file().exists():
+        issues.append("no state.json yet — run `core inject` once")
+    decisions = recent_decisions()
+    notes.append("{} decision(s) on record".format(len(decisions)))
+    n_loops = len(open_loops())
+    notes.append("{} open loop(s)".format(n_loops))
+    return issues, notes
+
+
+def cmd_doctor(args) -> int:
+    now_dt = now()
+    issues, notes = doctor_report(now_dt)
+    print("[core] doctor — {}".format(now_dt.strftime("%Y-%m-%d")))
+    for issue in issues:
+        print("  ! {}".format(issue))
+    for note in notes:
+        print("  · {}".format(note))
+    if not issues:
+        print("  healthy: no overdue loops, no stale references")
+    else:
+        print("  {} issue(s) found".format(len(issues)))
+    return 1 if issues else 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="core", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -340,6 +428,9 @@ def main(argv=None) -> int:
     p_search = sub.add_parser("search", help="search all ledgers, newest to oldest")
     p_search.add_argument("query")
     p_search.set_defaults(func=cmd_search)
+
+    p_doctor = sub.add_parser("doctor", help="health check: overdue loops, stale references")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args(argv)
     return args.func(args)
