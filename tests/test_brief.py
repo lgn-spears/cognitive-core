@@ -282,3 +282,59 @@ def test_unpushed_shows_five_largest_then_summarizes(tmp_path):
     assert lines[4].strip() == "3 unpushed commits in r3."
     assert len(lines) == 5
     assert "  2 more repos have unpushed work (3 commits)." in r.stdout
+
+
+import datetime as _dt
+import shutil
+
+LAUNCHCTL = (
+    "printf 'PID\\tStatus\\tLabel\\n'\n"
+    "printf -- '-\\t0\\tcom.oldclient.sync\\n'\n"
+    "printf -- '-\\t0\\tcom.oldclient.report\\n'\n"
+    "printf -- '412\\t0\\tcom.oldclient.watch\\n'\n"
+    "printf -- '-\\t78\\tcom.oldclient.backfill\\n'\n"
+    "printf -- '-\\t0\\tcom.apple.unrelated\\n'\n"
+)
+
+
+def test_launchd_reports_loaded_jobs_for_ended_work(tmp_path):
+    # Jobs that succeed for work that is over are worse than failing ones:
+    # nothing ever alerts on them. The exit-0 count is the point.
+    ended = (_dt.date.today() - _dt.timedelta(days=70)).isoformat()
+    conf(tmp_path, "repo_root {}\nended com.oldclient. {}\n".format(tmp_path / "none", ended))
+    stubs = stub(tmp_path, "launchctl", LAUNCHCTL)
+    r = run_core(tmp_path, "brief", path_prefix=stubs)
+    assert "STILL RUNNING, SHOULDN'T BE" in r.stdout
+    assert "  4 scheduled jobs matching com.oldclient. are still loaded, 10 weeks after that work ended." in r.stdout
+    assert "     3 of the 4 last exited 0 - they are not erroring, they are succeeding." in r.stdout
+    assert "com.apple" not in r.stdout
+
+
+def test_launchd_without_end_date_omits_the_age(tmp_path):
+    conf(tmp_path, "repo_root {}\nended com.oldclient.\n".format(tmp_path / "none"))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "launchctl", LAUNCHCTL))
+    assert "  4 scheduled jobs matching com.oldclient. are still loaded." in r.stdout
+
+
+def test_launchd_silent_without_ended_config(tmp_path):
+    # Core cannot know which work is over; without the user's word it says nothing.
+    conf(tmp_path, "repo_root {}\n".format(tmp_path / "none"))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "launchctl", LAUNCHCTL))
+    assert r.stdout.strip() == "[core] brief — nothing needs you right now."
+
+
+def test_launchd_silent_when_launchctl_fails(tmp_path):
+    conf(tmp_path, "repo_root {}\nended com.oldclient.\n".format(tmp_path / "none"))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "launchctl", "exit 1"))
+    assert r.returncode == 0
+    assert r.stdout.strip() == "[core] brief — nothing needs you right now."
+
+
+def test_audits_parse_under_system_bash():
+    # Users run macOS /bin/bash 3.2; Homebrew bash on a dev box would hide breakage.
+    system_bash = Path("/bin/bash")
+    if not system_bash.exists():
+        return
+    for script in sorted(AUDITS.glob("*.sh")):
+        r = subprocess.run([str(system_bash), "-n", str(script)], capture_output=True, text=True)
+        assert r.returncode == 0, "{}: {}".format(script.name, r.stderr)
