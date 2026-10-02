@@ -75,8 +75,8 @@ it with `core loop add "<promise>"`.
 | `core inbox` / `core inbox ack <id>` | list undelivered results / mark one as seen |
 | `core brief [--deliver]` | run the read-only audits in `audits/` — repos with no remote, unpushed work, scheduled jobs for work that has ended; `--deliver` puts each audit's findings in the inbox (one item per audit, updated on re-run) |
 
-| `core run NAME [--timeout S] -- CMD...` | run a background job under a lease (no overlap; released automatically if the job dies), with a timeout that kills its whole process group, recording start/finish/status/last line in `~/.core/heartbeat.json` |
-| `core heartbeat` | alarms for every pass in `~/.core/passes.conf` (`expect NAME every 1d`) that never ran, failed, timed out, died mid-run, or is overdue (1.5x its interval); exit 1 when any |
+| `core run NAME [--timeout S] -- CMD...` | run a background job under a lease (no overlap; if the wrapper is killed it kills the job's process group, and a still-alive orphan from a hard kill blocks the next run and keeps alarming), with a timeout that kills its whole process group, recording start/finish/status/last line in `~/.core/heartbeat.json` |
+| `core heartbeat` | alarms for every pass in `~/.core/passes.conf` (`expect NAME every 1d`) that never ran, failed, timed out, was killed, has been running too long, died mid-run, or is overdue (1.5x its interval); unparseable `passes.conf` lines are alarms too; exit 1 when any |
 
 **Heartbeats come first.** A schedule is not proof a job ran. `core inject` puts `HEARTBEAT ALARM:` lines
 right under its header, and `core brief` opens with `NOT RUNNING THAT SHOULD BE`.

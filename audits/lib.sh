@@ -62,3 +62,13 @@ date_epoch() {  # date_epoch YYYY-MM-DD -> epoch seconds (macOS or GNU date)
 plural() {  # plural N singular [plural]
   if [ "$1" -eq 1 ]; then echo "$2"; else echo "${3:-${2}s}"; fi
 }
+
+unreadable_dirs() {  # names of top-level folders under the roots that can't be listed from here
+  repo_roots | while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    for d in "$root"/*/; do
+      [ -d "$d" ] || continue
+      ls "$d" >/dev/null 2>&1 || basename "$d"
+    done
+  done | sort -u
+}

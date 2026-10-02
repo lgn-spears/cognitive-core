@@ -19,6 +19,13 @@ done <<EOF
 $(list_repos)
 EOF
 
+blocked="$(unreadable_dirs)"
+if [ -n "$blocked" ]; then
+  nb=$(printf '%s\n' "$blocked" | wc -l | tr -d ' ')
+  printf "Couldn't look inside %s %s from here: %s.\n" "$nb" "$(plural "$nb" folder)" \
+    "$(printf '%s\n' "$blocked" | paste -sd, - | sed 's/,/, /g')"
+fi
+
 [ "$repos" -gt 0 ] || exit 0
 
 detail="Oldest commit is $(old "$oldest")."

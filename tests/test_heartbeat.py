@@ -189,3 +189,83 @@ def test_brief_shows_alarms_first(tmp_path):
     out = subprocess.run(["python3", str(CORE), "brief"], capture_output=True, text=True, env=env).stdout
     assert out.splitlines()[0] == "NOT RUNNING THAT SHOULD BE"
     assert "audits has never run" in out.splitlines()[1]
+
+
+# ---- step-3 final-review fix pass ----
+
+def test_hung_job_alarms_and_timeout_cannot_be_bypassed(tmp_path):
+    # A grandchild that escapes the process group must not wedge core run or hide the job.
+    passes(tmp_path, "expect c every 1m\n")
+    start = time.time()
+    run_core(tmp_path, "run", "c", "--timeout", "2", "--", "python3", "-c",
+             "import os,time\nif os.fork()==0:\n os.setsid(); time.sleep(20)\nelse:\n time.sleep(30)")
+    assert time.time() - start < 10
+    assert records(tmp_path)["c"]["status"] == "timeout"
+
+
+def test_long_running_job_with_lease_held_alarms(tmp_path):
+    passes(tmp_path, "expect audits every 1m\n")
+    job = subprocess.Popen(["python3", str(CORE), "run", "audits", "--", "sleep", "200"], env=env_for(tmp_path))
+    time.sleep(0.7)
+    data = records(tmp_path)
+    data["audits"]["started"] = ago(minutes=5)
+    (tmp_path / "corehome" / "heartbeat.json").write_text(json.dumps(data))
+    r = run_core(tmp_path, "heartbeat")
+    job.kill(); job.wait()
+    assert r.returncode == 1 and "audits has been running for 5 min" in r.stdout
+
+
+def test_terminating_core_run_kills_its_job(tmp_path):
+    marker = "hb-term-{}".format(os.getpid())
+    job = subprocess.Popen(["python3", str(CORE), "run", "a", "--", "sh", "-c", "sleep 30 # {}".format(marker)],
+                           env=env_for(tmp_path))
+    time.sleep(0.8)
+    job.terminate(); job.wait()
+    time.sleep(0.5)
+    left = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.strip()
+    assert left == ""
+    assert records(tmp_path)["a"]["status"] == "killed"
+
+
+def test_next_run_refuses_while_orphaned_group_alive(tmp_path):
+    # If the wrapper died hard, its job may still run: the next run must not overlap it or clear the alarm.
+    passes(tmp_path, "expect a every 1d\n")
+    orphan = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    put_record(tmp_path, "a", status="running", started=ago(minutes=2), pgid=orphan.pid, last_line="")
+    r = run_core(tmp_path, "run", "a", "--", "echo", "second")
+    hb = run_core(tmp_path, "heartbeat")
+    orphan.kill(); orphan.wait()
+    assert "skipped" in r.stdout and records(tmp_path)["a"]["status"] == "running"
+    assert "never finished" in hb.stdout
+
+
+def test_background_child_does_not_cause_false_timeout(tmp_path):
+    start = time.time()
+    r = run_core(tmp_path, "run", "b", "--timeout", "8", "--", "sh", "-c", "echo hi; (sleep 20 &); exit 0")
+    assert time.time() - start < 6
+    rec = records(tmp_path)["b"]
+    assert rec["status"] == "ok" and rec["last_line"] == "hi" and r.returncode == 0
+
+
+def test_large_output_streams_without_buffering(tmp_path):
+    r = run_core(tmp_path, "run", "big", "--", "python3", "-c",
+                 "import sys\nfor i in range(200000): sys.stdout.write('x'*500+'\\n')\nprint('the end')")
+    assert records(tmp_path)["big"]["last_line"] == "the end"
+    assert r.returncode == 0
+
+
+def test_bad_passes_conf_lines_alarm(tmp_path):
+    passes(tmp_path, "expect a every 1d\nexpect b every 30s\nExpect c every 1d\nexpect d every 1h  # nightly\n")
+    put_record(tmp_path, "a", status="ok", exit=0, started=ago(hours=1), finished=ago(hours=1), last_line="")
+    put_record(tmp_path, "d", status="ok", exit=0, started=ago(minutes=5), finished=ago(minutes=5), last_line="")
+    out = run_core(tmp_path, "heartbeat").stdout
+    assert "passes.conf line 2 not understood: expect b every 30s" in out
+    assert "passes.conf line 3 not understood" in out
+    assert "line 4" not in out  # trailing comments are fine
+
+
+def test_name_typo_is_pointed_out(tmp_path):
+    passes(tmp_path, "expect audits every 1d\n")
+    put_record(tmp_path, "audit", status="ok", exit=0, started=ago(hours=1), finished=ago(hours=1), last_line="")
+    out = run_core(tmp_path, "heartbeat").stdout
+    assert "audits has never run (expected every 1d; recorded but not expected: audit)" in out

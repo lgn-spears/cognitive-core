@@ -36,6 +36,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -923,27 +924,69 @@ def record_heartbeat(name: str, rec: dict) -> None:
         os.replace(tmp, home_dir() / "heartbeat.json")
 
 
-def run_command(cmd, timeout: int):
-    """Run cmd in its own process group; echo its output. Returns (status, exit_code, last_line)."""
+RUN_TAIL_BYTES = 4096
+
+
+def run_command(cmd, timeout: int, on_start=None):
+    """Run cmd in its own process group, streaming its output through and keeping only a tail.
+    Waits on the process itself (not its pipe), so an escaped grandchild can't wedge the wrapper.
+    Returns (status, exit_code, last_line)."""
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                errors="replace", start_new_session=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     except OSError as e:
         return "failed", 127, one_line("could not start {}: {}".format(cmd[0] if cmd else "(nothing)", e), 200)
+    if on_start:
+        on_start(proc)
+    tail = [b""]
+
+    def pump():
+        while True:
+            chunk = proc.stdout.read1(65536)
+            if not chunk:
+                return
+            try:
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+            tail[0] = (tail[0] + chunk)[-RUN_TAIL_BYTES:]
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
     try:
-        out, _ = proc.communicate(timeout=timeout)
+        code = proc.wait(timeout=timeout)
+        status = "ok" if code == 0 else "failed"
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        proc.communicate()
-        return "timeout", 124, "timed out after {}s".format(timeout)
-    if out:
-        sys.stdout.write(out)
-    lines = [l for l in out.splitlines() if l.strip()]
+        kill_group(proc.pid)
+        proc.wait()
+        status, code = "timeout", 124
+    reader.join(timeout=2)  # a background child may hold the pipe; never wait on it forever
+    if code < 0:
+        code = 128 - code  # killed by signal N -> 128+N, like a shell
+    lines = [l for l in tail[0].decode("utf-8", "replace").splitlines() if l.strip()]
     last = one_line(lines[-1], 200) if lines else ""
-    return ("ok" if proc.returncode == 0 else "failed"), proc.returncode, last
+    if status == "timeout":
+        last = "timed out after {}s".format(timeout) + (" (last output: {})".format(last) if last else "")
+    return status, code, last
+
+
+def kill_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def group_alive(pgid) -> bool:
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1:
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def cmd_run(args) -> int:
@@ -966,28 +1009,55 @@ def cmd_run(args) -> int:
         if not got:
             print("skipped: {} is already running".format(name))
             return 0
+        prev = read_heartbeats().get(name, {})
+        if prev.get("status") == "running" and group_alive(prev.get("pgid")):
+            print("skipped: {}'s previous run (process group {}) is still alive".format(name, prev.get("pgid")))
+            return 0
         started = now().isoformat(timespec="seconds")
         record_heartbeat(name, {"status": "running", "started": started, "pid": os.getpid(), "last_line": ""})
-        status, code, last = run_command(cmd, timeout)
+        child = {}
+
+        def on_start(proc):
+            child["pgid"] = proc.pid
+            record_heartbeat(name, {"status": "running", "started": started, "pid": os.getpid(),
+                                    "pgid": proc.pid, "last_line": ""})
+
+        def on_signal(signum, frame):
+            if "pgid" in child:
+                kill_group(child["pgid"])
+            record_heartbeat(name, {"status": "killed", "exit": 128 + signum, "started": started,
+                                    "finished": now().isoformat(timespec="seconds"),
+                                    "last_line": "core run stopped by signal {}".format(signum)})
+            os._exit(128 + signum)
+
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(sig, on_signal)
+        status, code, last = run_command(cmd, timeout, on_start)
         record_heartbeat(name, {"status": status, "exit": code, "started": started,
                                 "finished": now().isoformat(timespec="seconds"), "last_line": last})
         return code
 
 
 def read_expectations():
-    """[(name, seconds, text)] from passes.conf lines `expect NAME every <n>[mhd]`; bad lines skipped."""
+    """([(name, seconds, text)], [bad-line alarms]) from passes.conf: `expect NAME every <n>[mhd]`.
+    Trailing `# comments` are allowed; any other unparseable line is reported, never silently dropped."""
     try:
         lines = (home_dir() / "passes.conf").read_text(errors="replace").splitlines()
     except OSError:
-        return []
-    out = []
-    for line in lines:
+        return [], []
+    out, bad = [], []
+    for n, raw in enumerate(lines, 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
         parts = line.split()
-        if len(parts) == 4 and parts[0] == "expect" and parts[2] == "every" and ITEM_ID_RE.match(parts[1]):
-            m = DURATION_RE.match(parts[3])
-            if m and int(m.group(1)) > 0:
-                out.append((parts[1], int(m.group(1)) * DURATION_SECONDS[m.group(2)], parts[3]))
-    return out
+        m = DURATION_RE.match(parts[3]) if len(parts) == 4 else None
+        if (len(parts) == 4 and parts[0] == "expect" and parts[2] == "every" and ITEM_ID_RE.match(parts[1])
+                and m and int(m.group(1)) > 0):
+            out.append((parts[1], int(m.group(1)) * DURATION_SECONDS[m.group(2)], parts[3]))
+        else:
+            bad.append("passes.conf line {} not understood: {}".format(n, one_line(raw.strip(), 80)))
+    return out, bad
 
 
 def parse_time(value):
@@ -999,22 +1069,29 @@ def parse_time(value):
 
 
 def heartbeat_alarms():
-    """One line per pass that never ran, failed, timed out, died mid-run, or is overdue."""
-    alarms, recs, now_dt = [], read_heartbeats(), now()
-    for name, seconds, every in read_expectations():
+    """One line per pass that never ran, failed, timed out, was killed, hung, died mid-run, or is overdue."""
+    recs, now_dt = read_heartbeats(), now()
+    expects, alarms = read_expectations()
+    expected_names = {name for name, _, _ in expects}
+    stray = sorted(set(recs) - expected_names)
+    for name, seconds, every in expects:
         rec = recs.get(name)
         started = parse_time(rec.get("started")) if rec else None
         if not started:
-            alarms.append("{} has never run (expected every {})".format(name, every))
+            hint = "; recorded but not expected: {}".format(", ".join(stray)) if stray else ""
+            alarms.append("{} has never run (expected every {}{})".format(name, every, hint))
             continue
         status, last = rec.get("status"), one_line(str(rec.get("last_line") or ""), 200)
         if status == "running":
             if not lease_held(name):
                 alarms.append("{} started {} and never finished".format(name, human_gap(now_dt - started)))
+            elif (now_dt - started).total_seconds() > seconds * HEARTBEAT_GRACE:
+                alarms.append("{} has been running for {} (expected every {}) — may be hung".format(
+                    name, human_gap(now_dt - started).replace(" ago", ""), every))
             continue
         finished = parse_time(rec.get("finished")) or started
-        if status in ("failed", "timeout"):
-            verb = "failed" if status == "failed" else "timed out"
+        if status in ("failed", "timeout", "killed"):
+            verb = {"failed": "failed", "timeout": "timed out", "killed": "was killed"}[status]
             alarms.append("{} {} {}{}".format(name, verb, human_gap(now_dt - finished),
                                               ": " + last if last else ""))
             continue

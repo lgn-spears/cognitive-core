@@ -461,3 +461,18 @@ def test_unpushed_counts_detached_head_commits(tmp_path):
     conf(tmp_path, "repo_root {}\n".format(root))
     r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
     assert "  2 unpushed commits in proj." in r.stdout
+
+
+def test_unreadable_folders_are_reported_not_skipped(tmp_path):
+    # Background jobs on macOS can't see privacy-protected folders; a silent skip is a hidden gap.
+    root = tmp_path / "home2"
+    make_repo(root / "visible", 1)
+    make_repo(root / "Locked" / "hidden", 2)
+    os.chmod(str(root / "Locked"), 0)
+    try:
+        conf(tmp_path, "repo_root {}\n".format(root))
+        r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    finally:
+        os.chmod(str(root / "Locked"), 0o755)
+    assert "  1 commit in 1 repo has no git remote at all." in r.stdout
+    assert "  Couldn't look inside 1 folder from here: Locked." in r.stdout
