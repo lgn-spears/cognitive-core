@@ -30,6 +30,16 @@ if [ -n "$blocked" ]; then
     "$(printf '%s\n' "$blocked" | paste -sd, - | sed 's/,/, /g')"
 fi
 
+missing="$(missing_roots)"
+if [ -n "$missing" ]; then
+  printf '%s\n' "$missing" | while IFS= read -r r; do
+    printf "repo_root %s doesn't exist — nothing there was checked (fix it in audits.conf).\n" "$r"
+  done
+fi
+if [ -z "$(unique_repos | head -1)" ]; then
+  printf "Found no git repos under: %s — nothing was checked.\n" "$(repo_roots | paste -sd, - | sed 's/,/, /g')"
+fi
+
 [ "$repos" -gt 0 ] || exit 0
 
 detail="Oldest commit is $(old "$oldest")."

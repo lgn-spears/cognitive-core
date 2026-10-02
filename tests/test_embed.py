@@ -306,3 +306,61 @@ def test_zero_vectors_fall_back_to_words(server, tmp_path):
     finally:
         globals()["fake_vec"] = real
     assert "project_av_chain.md" in out
+
+
+# ---- release review fixes ----
+
+def test_note_written_after_indexing_is_still_found_by_words(server, tmp_path):
+    mem = setup(tmp_path, server, NOTES)
+    core(tmp_path, "recall", "--reindex")
+    (mem / "project_quokka.md").write_text("Quokka billing service API key lives in the Ops vault\n")
+    out = ask(tmp_path, "where is the quokka billing api key")
+    assert "project_quokka.md" in out
+
+
+def test_edited_note_is_never_cited_with_old_content(server, tmp_path):
+    mem = setup(tmp_path, server, {"project_zebra.md": "description: zebra postgres listens on port 5544\n"})
+    core(tmp_path, "recall", "--reindex")
+    time.sleep(1.1)
+    (mem / "project_zebra.md").write_text("description: zebra postgres listens on port 6000\n")
+    out = ask(tmp_path, "what port does zebra postgres use")
+    assert "5544" not in out
+
+
+def test_tiny_memory_uses_words(server, tmp_path):
+    h = tmp_path / "corehome"; h.mkdir()
+    mem = tmp_path / "mem"; mem.mkdir()
+    (mem / "project_zebra.md").write_text("Zebra postgres listens on port 5544\n")
+    (mem / "other.md").write_text("garden notes\n")
+    (h / "recall.conf").write_text("memory_dir {}\nembed_model fake-embed\nembed_url {}\n".format(mem, server))
+    core(tmp_path, "recall", "--reindex")
+    assert "project_zebra.md" in ask(tmp_path, "what port does zebra postgres use")
+
+
+def test_blank_note_does_not_keep_index_stale(server, tmp_path):
+    mem = setup(tmp_path, server, dict(NOTES, **{"empty_ish.md": "\n\n\n"}))
+    core(tmp_path, "recall", "--reindex")
+    before = index_files(tmp_path).stat().st_mtime
+    time.sleep(1.1)
+    core(tmp_path, "inject")
+    time.sleep(1.5)
+    assert index_files(tmp_path).stat().st_mtime == before
+    log = tmp_path / "corehome" / "logs" / "recall-index.log"
+    assert not log.exists() or "up to date" not in log.read_text()
+
+
+def test_fifo_index_never_hangs_the_session(server, tmp_path):
+    setup(tmp_path, server, NOTES)
+    os.mkfifo(str(index_files(tmp_path)))
+    start = time.time()
+    assert core(tmp_path, "inject").returncode == 0
+    assert core(tmp_path, "recall", stdin=json.dumps({"prompt": "the ATEM switcher"})).returncode == 0
+    assert time.time() - start < 5
+
+
+def test_orphaned_vector_files_are_cleaned_up(server, tmp_path):
+    setup(tmp_path, server, NOTES)
+    (tmp_path / "corehome" / "recall-index-deadbeef.f32").write_bytes(b"\0" * 64)
+    core(tmp_path, "recall", "--reindex")
+    vecs = list((tmp_path / "corehome").glob("recall-index-*.f32"))
+    assert len(vecs) == 1 and "deadbeef" not in vecs[0].name

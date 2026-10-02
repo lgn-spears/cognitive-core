@@ -9,7 +9,8 @@ is a slim reasoning model with knowledge living *outside* its weights —
 user-owned files instead of vendor lock-in. This repo ships that periphery,
 today, for working agents.
 
-Zero dependencies. No network. No daemon. Nothing leaves your machine.
+Zero dependencies. No daemon. Nothing leaves your machine — by default there is no network at all
+(the optional meaning-based recall talks to a local model server you run).
 
 ```
                     ┌──────────────────┐
@@ -31,17 +32,19 @@ core inject         # first session block prints
 
 Python 3.9+ only.
 
-## Wire it into your harness (2 lines)
+## Wire it into your harness
 
 **Claude Code** (`~/.claude/settings.json`):
 
 ```json
 "hooks": {
-  "SessionStart": [{ "hooks": [{ "type": "command", "command": "/path/to/core inject", "timeout": 10 }] }],
-  "Stop":         [{ "hooks": [{ "type": "command", "command": "/path/to/core close", "timeout": 10 }] }],
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/path/to/core recall", "timeout": 5 }] }]
+  "SessionStart": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/core inject", "timeout": 10 }] }],
+  "Stop":         [{ "hooks": [{ "type": "command", "command": "~/.local/bin/core close", "timeout": 10 }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/core recall", "timeout": 5 }] }]
 }
 ```
+
+(Use the path `./install.sh` printed if you installed somewhere else.)
 
 `core recall` is optional and makes every message recall-aware: it reads the prompt from the hook's
 stdin, searches your memory files with your own words, and prints the best matching lines cited
@@ -65,23 +68,25 @@ it with `core loop add "<promise>"`.
 | `core inject` | print session context; record activity |
 | `core log "text"` | journal entry worth remembering |
 | `core decision "chose X — because Y"` | settled; resurfaces as SETTLED forever |
-| `core loop add "promise"` / `done` / list | prospective memory |
+| `core loop add "promise"` / `core loop done "match"` / `core loop` | open, close, list promises |
 | `core day [date]` | replay one day's full ledger |
 | `core search "query"` | search every day's ledger |
 | `core doctor` | health check: overdue loops, stale file references |
 | `core close` | silently mark activity (stop hooks) |
 | `core recall` | (UserPromptSubmit hook) cited memory lines for this message + undelivered results; `--reindex` builds the optional embedding index |
 | `core deliver "text" --source NAME [--key K]` | a background job hands a result to the inbox (same key while pending = same item) |
-| `core inbox` / `core inbox ack <id>` | list undelivered results / mark one as seen |
+| `core inbox` / `core inbox ack <id>` | list every undelivered result / mark one as seen (a unique part of the id is enough) |
 | `core brief [--deliver]` | run the read-only audits in `audits/` — repos with no remote, unpushed work, scheduled jobs for work that has ended; `--deliver` puts each audit's findings in the inbox (one item per audit, updated on re-run) |
-| `core deliver ... --replace` | same key while pending → update that item's text to this one (what is true now) |
+| `core deliver ... --replace` | same key while pending → update that item's text to this one (without it the pending text is kept, and it tells you) |
 | `core run NAME [--timeout S] -- CMD...` | run a background job under a lease (no overlap; if the wrapper is killed it kills the job's process group, and a still-alive orphan from a hard kill blocks the next run and keeps alarming), with a timeout that kills its whole process group, recording start/finish/status/last line in `~/.core/heartbeat.json` |
 | `core heartbeat` | alarms for every pass in `~/.core/passes.conf` (`expect NAME every 1d`) that never ran, failed, timed out, was killed, has been running too long, died mid-run, or is overdue (1.5x its interval); unparseable `passes.conf` lines are alarms too; exit 1 when any |
 
 **Audits** are plain bash scripts listed in `audits/MANIFEST`, one finding per output line. Configure in
 `~/.core/audits.conf` (one `key value` per line, `#` comments allowed): `repo_root <dir>` (default `~/code`
 and `~`) and `ended <launchd-label-prefix> [YYYY-MM-DD]` for scheduled jobs that belong to work that's over.
-If git is missing or broken, the audit fails loudly — it never reports "nothing needs you" when it couldn't look.
+It never reports "nothing needs you" when it couldn't look: a broken git fails the audit, and a
+`repo_root` that doesn't exist or holds no repos is reported as such. "Unpushed work" means commits;
+uncommitted edits in a pushed repo aren't flagged.
 
 **Run it every morning (macOS)** — save as `~/Library/LaunchAgents/com.you.core-audits.plist`, then
 `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.you.core-audits.plist`:
@@ -128,15 +133,24 @@ If the server is down or slow (>1s), recall silently falls back to words — it 
 Requests go straight to `embed_url` and never through a system proxy. **`embed_url` decides where your
 memory goes:** the default is this machine; pointing it at another host sends every message and your
 whole memory there, unencrypted over plain HTTP.
-Measured on 61 real, unseen messages with blind relevance judgments: stays silent 97% of the time when
-nothing is relevant, puts the right note in the top 3 for 77%, and 74% of what it shows is relevant
-(words alone: 90% / 74% / 51%). `tools/eval_recall.py` scores recall against your own labeled messages.
+How much it helps depends on how much memory you have, so here are both ends, measured on messages
+labeled before recall ran:
+
+| memory | silent when nothing's relevant | right note in top 3 | shown notes relevant |
+|---|---|---|---|
+| ~3,000 notes, 61 real unseen messages, blind-judged — words | 90% | 74% | 51% |
+| same — with meaning | **97%** | **77%** | **75%** |
+| 76 notes, 40 messages — words | 100% | 65% | 64% |
+| same — with meaning | 90% | 70% | 60% |
+
+On a large memory it is clearly better; on a small one it's roughly even (it finds a few notes words
+miss, such as "Rust extensions" → your editor preferences, and adds a few loose matches). Notes written
+since the last index, and memories under ~30 chunks, are matched by words. `tools/eval_recall.py`
+scores recall against your own labeled messages — a JSON list of
+`{"prompt": "...", "expect": "recall" | "silent", "relevant": ["note_name", ...], "split": "dev"}`.
 
 **Heartbeats come first.** A schedule is not proof a job ran. `core inject` puts `HEARTBEAT ALARM:` lines
 right under its header, and `core brief` opens with `NOT RUNNING THAT SHOULD BE`.
-
-**Audits** are plain bash scripts listed in `audits/MANIFEST`, one finding per output line. Configure in
-`~/.core/audits.conf`: `repo_root <dir>` (default `~/code` and `~`) and `ended <launchd-label-prefix> [YYYY-MM-DD]`.
 
 **Delivery rule:** an inbox item is shown at session start and on every message until it is
 acknowledged. Writing a result down is never the same as the person having seen it.

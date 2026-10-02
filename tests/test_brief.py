@@ -320,14 +320,14 @@ def test_launchd_silent_without_ended_config(tmp_path):
     # Core cannot know which work is over; without the user's word it says nothing.
     conf(tmp_path, "repo_root {}\n".format(tmp_path / "none"))
     r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "launchctl", LAUNCHCTL))
-    assert r.stdout.strip() == "[core] brief — nothing needs you right now."
+    assert "STILL RUNNING" not in r.stdout  # (the missing repo_root is reported separately)
 
 
 def test_launchd_silent_when_launchctl_fails(tmp_path):
     conf(tmp_path, "repo_root {}\nended com.oldclient.\n".format(tmp_path / "none"))
     r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "launchctl", "exit 1"))
     assert r.returncode == 0
-    assert r.stdout.strip() == "[core] brief — nothing needs you right now."
+    assert "STILL RUNNING" not in r.stdout  # (the missing repo_root is reported separately)
 
 
 def test_audits_parse_under_system_bash():

@@ -39,6 +39,12 @@ list_repos() {  # unique repo directories under the roots, one per line
   done | sed 's#/\.git$##' | sort -u
 }
 
+missing_roots() {  # configured roots that don't exist (a typo must never read as "all clear")
+  repo_roots | while IFS= read -r root; do
+    [ -d "$root" ] || printf '%s\n' "$root"
+  done
+}
+
 ago() {  # ago EPOCH -> today | 1 day | N days | N weeks | N months
   local days=$(( ( $(date +%s) - $1 ) / 86400 ))
   if [ "$days" -lt 1 ]; then echo "today"

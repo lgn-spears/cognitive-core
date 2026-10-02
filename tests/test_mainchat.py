@@ -94,7 +94,7 @@ def test_recall_caps_hits_and_line_length(tmp_path):
     mem = tmp_path / "mem"
     for k in range(4):  # a specific match (3 lines per file) inside an otherwise unrelated memory
         write_mem(mem, "f{}.md".format(k),
-                  "".join("alpha beta {} {}\n".format(i, "x" * 400) for i in range(3))
+                  "".join("alpha beta {} {} {}\n".format(k, i, "x" * 400) for i in range(3))
                   + "".join("unrelated filler note {}\n".format(i) for i in range(200)))
     conf(tmp_path, mem)
     r = run_core(tmp_path, "recall", stdin=prompt("alpha beta"))
@@ -196,7 +196,7 @@ def test_inbox_shows_at_most_three_oldest_first(tmp_path):
     out = run_core(tmp_path, "recall", stdin=prompt("ok")).stdout
     shown = [i for i in ids if i in out]
     assert shown == ids[:3]
-    assert "2 more in `core inbox`" in out
+    assert "2 more — `core inbox` lists them all" in out
 
 
 def test_inject_includes_pending_inbox(tmp_path):
