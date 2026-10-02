@@ -338,3 +338,60 @@ def test_audits_parse_under_system_bash():
     for script in sorted(AUDITS.glob("*.sh")):
         r = subprocess.run([str(system_bash), "-n", str(script)], capture_output=True, text=True)
         assert r.returncode == 0, "{}: {}".format(script.name, r.stderr)
+
+
+# ---- Task 5: findings into the inbox ----
+
+import json as _json
+
+
+def inbox_items(tmp_path):
+    d = tmp_path / "corehome" / "inbox"
+    return [_json.loads(p.read_text()) for p in sorted(d.glob("*.json"))] if d.is_dir() else []
+
+
+def test_deliver_replace_updates_pending_text_keeps_id(tmp_path):
+    # A re-run should say what is true now, not keep the stale first version.
+    a = run_core(tmp_path, "deliver", "4 repos have no remote", "--source", "audits", "--key", "k").stdout.strip()
+    b = run_core(tmp_path, "deliver", "5 repos have no remote", "--source", "audits", "--key", "k",
+                 "--replace").stdout.strip()
+    assert a == b
+    items = inbox_items(tmp_path)
+    assert len(items) == 1 and items[0]["text"] == "5 repos have no remote"
+
+
+def test_deliver_without_replace_keeps_first_text(tmp_path):
+    run_core(tmp_path, "deliver", "first", "--source", "s", "--key", "k")
+    run_core(tmp_path, "deliver", "second", "--source", "s", "--key", "k")
+    assert [i["text"] for i in inbox_items(tmp_path)] == ["first"]
+
+
+def two_audits(tmp_path, a_text, b_text):
+    d = tmp_path / "audits"
+    write_audit(d, "a.sh", "printf '{}\\tdetail a\\n'".format(a_text))
+    write_audit(d, "b.sh", "printf '{}\\n'".format(b_text))
+    write_audit(d, "quiet.sh", "exit 0")
+    (d / "MANIFEST").write_text("a.sh  OPEN, NOBODY WAITING ON ME\nb.sh  OPEN, NOBODY WAITING ON ME\n"
+                                "quiet.sh  STILL RUNNING, SHOULDN'T BE\n")
+    return d
+
+
+def test_brief_deliver_one_item_per_audit(tmp_path):
+    d = two_audits(tmp_path, "3 repos lonely", "2 jobs orphaned")
+    r = run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    assert r.returncode == 0 and "3 repos lonely" in r.stdout
+    items = inbox_items(tmp_path)
+    assert sorted(i["key"] for i in items) == ["audit:a.sh", "audit:b.sh"]
+    assert all(i["source"] == "audits" and i["status"] == "pending" for i in items)
+
+
+def test_brief_deliver_rerun_updates_not_duplicates(tmp_path):
+    run_core(tmp_path, "brief", "--deliver", audits_dir=two_audits(tmp_path, "3 repos lonely", "2 jobs"))
+    run_core(tmp_path, "brief", "--deliver", audits_dir=two_audits(tmp_path, "4 repos lonely", "2 jobs"))
+    texts = sorted(i["text"] for i in inbox_items(tmp_path))
+    assert texts == ["2 jobs", "4 repos lonely"]
+
+
+def test_brief_without_deliver_writes_nothing(tmp_path):
+    run_core(tmp_path, "brief", audits_dir=two_audits(tmp_path, "3 repos lonely", "2 jobs"))
+    assert not (tmp_path / "corehome").exists()

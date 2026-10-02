@@ -673,15 +673,19 @@ def render_inbox(items):
     return lines
 
 
-def cmd_deliver(args) -> int:
-    text, source = valid_utf8(args.text), valid_utf8(args.source)
-    key = valid_utf8(args.key) if args.key else hashlib.sha1(
+def deliver_item(text: str, source: str, key: str = "", replace: bool = False) -> str:
+    """Put one result in the inbox; returns its id. Same key while pending = same item
+    (with replace=True its text is updated to what is true now)."""
+    text, source = valid_utf8(text), valid_utf8(source)
+    key = valid_utf8(key) if key else hashlib.sha1(
         "{}\n{}".format(source, text).encode("utf-8")).hexdigest()[:12]
     with inbox_lock():
         for it in pending_inbox():
             if it["key"] == key:
-                print(it["id"])
-                return 0
+                if replace and (it["text"] != text or it["source"] != source):
+                    it.update(text=text, source=source, at=now().isoformat(timespec="seconds"))
+                    write_item(it)
+                return it["id"]
         now_dt = now()
         item = {
             "id": "{}-{}".format(now_dt.strftime("%Y%m%d%H%M%S"), os.urandom(3).hex()),
@@ -690,7 +694,11 @@ def cmd_deliver(args) -> int:
             "status": "pending", "shown": 0,
         }
         write_item(item)
-    print(item["id"])
+        return item["id"]
+
+
+def cmd_deliver(args) -> int:
+    print(deliver_item(args.text, args.source, args.key or "", args.replace))
     return 0
 
 
@@ -800,6 +808,11 @@ def cmd_brief(args) -> int:
         findings, error = run_audit(path, env, timeout)
         results.append((heading, findings, error, script))
     print(render_brief(results))
+    if getattr(args, "deliver", False):
+        for heading, findings, error, script in results:
+            if findings:
+                deliver_item(" · ".join(head for head, _ in findings), "audits",
+                             "audit:{}".format(script), replace=True)
     return 0
 
 
@@ -839,6 +852,7 @@ def main(argv=None) -> int:
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_brief = sub.add_parser("brief", help="what needs you right now (read-only audits)")
+    p_brief.add_argument("--deliver", action="store_true", help="also put each audit's findings in the inbox")
     p_brief.set_defaults(func=cmd_brief)
 
     p_recall = sub.add_parser("recall", help="(UserPromptSubmit hook) cited memory hits for this message")
@@ -849,6 +863,7 @@ def main(argv=None) -> int:
     p_deliver.add_argument("text")
     p_deliver.add_argument("--source", required=True)
     p_deliver.add_argument("--key", help="dedupe key; same key while pending = same item")
+    p_deliver.add_argument("--replace", action="store_true", help="update the pending item's text to this one")
     p_deliver.set_defaults(func=cmd_deliver)
 
     p_inbox = sub.add_parser("inbox", help="list undelivered results, or ack one")
