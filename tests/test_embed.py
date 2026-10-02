@@ -186,3 +186,123 @@ def test_session_start_refreshes_a_stale_index_in_background(server, tmp_path):
         time.sleep(0.3)
     else:
         raise AssertionError("stale index was not refreshed")
+
+
+# ---- review fix pass ----
+
+def index_files(tmp_path):
+    return tmp_path / "corehome" / "recall-index.json"
+
+
+def test_session_start_does_not_rewrite_unchanged_index(server, tmp_path):
+    # Every session writes a "session start" ledger line; that alone must not rebuild the index.
+    setup(tmp_path, server, NOTES)
+    core(tmp_path, "recall", "--reindex")
+    before = index_files(tmp_path).stat().st_mtime
+    time.sleep(1.1)
+    for _ in range(3):
+        core(tmp_path, "inject")
+    time.sleep(1.5)
+    assert index_files(tmp_path).stat().st_mtime == before
+
+
+def test_deleting_a_note_or_changing_model_marks_index_stale(server, tmp_path):
+    mem = setup(tmp_path, server, NOTES)
+    core(tmp_path, "recall", "--reindex")
+    (mem / "project_av_chain.md").unlink()
+    core(tmp_path, "inject")
+    for _ in range(30):
+        meta = json.loads(index_files(tmp_path).read_text())
+        if not any(c["path"].endswith("project_av_chain.md") for c in meta["chunks"]):
+            break
+        time.sleep(0.3)
+    else:
+        raise AssertionError("deleted note still indexed")
+
+
+def test_file_edited_during_reindex_is_picked_up_next_time(server, tmp_path):
+    mem = setup(tmp_path, server, NOTES)
+    Fake.delay = 1.5
+    env = {"HOME": str(tmp_path), "CORE_HOME": str(tmp_path / "corehome"), "PATH": os.environ["PATH"]}
+    job = subprocess.Popen(["python3", str(CORE), "recall", "--reindex"], env=env, stdout=subprocess.DEVNULL)
+    time.sleep(0.5)
+    (mem / "reference_timesfm.md").write_text("description: edited mid-run about solar panels\n")
+    job.wait()
+    Fake.delay = 0
+    core(tmp_path, "recall", "--reindex")
+    meta = json.loads(index_files(tmp_path).read_text())
+    texts = [c["text"] for c in meta["chunks"] if c["path"].endswith("reference_timesfm.md")]
+    assert any("solar panels" in t for t in texts)
+
+
+def test_proxy_settings_never_see_memory(server, tmp_path):
+    # "Nothing leaves your machine" must hold even with a system proxy configured.
+    import socket
+    sink = socket.socket(); sink.bind(("127.0.0.1", 0)); sink.listen(5); sink.settimeout(0.2)
+    proxy = "http://127.0.0.1:{}".format(sink.getsockname()[1])
+    setup(tmp_path, server, NOTES)
+    env = {"HOME": str(tmp_path), "CORE_HOME": str(tmp_path / "corehome"), "PATH": os.environ["PATH"],
+           "HTTP_PROXY": proxy, "http_proxy": proxy, "ALL_PROXY": proxy}
+    subprocess.run(["python3", str(CORE), "recall", "--reindex"], env=env, capture_output=True, timeout=30)
+    try:
+        conn, _ = sink.accept()
+        got = conn.recv(4096); conn.close()
+    except socket.timeout:
+        got = b""
+    sink.close()
+    assert got == b"", "memory content went through the proxy"
+
+
+def test_trickling_or_unresolvable_server_is_bounded(server, tmp_path):
+    setup(tmp_path, server, NOTES)
+    core(tmp_path, "recall", "--reindex")
+    conf = tmp_path / "corehome" / "recall.conf"
+    conf.write_text(conf.read_text().replace(server, "http://no-such-host.invalid:11434"))
+    start = time.time()
+    r = core(tmp_path, "recall", stdin=json.dumps({"prompt": "the ATEM switcher setup"}))
+    assert r.returncode == 0 and time.time() - start < 2.5
+
+
+def test_partial_first_index_keeps_finished_batches(server, tmp_path):
+    notes = {"n{}.md".format(i): "description: note {} about topic{}\n".format(i, i) for i in range(300)}
+    setup(tmp_path, server, notes)
+    real = Fake.do_POST
+    count = {"n": 0}
+
+    def flaky(self):
+        count["n"] += 1
+        if count["n"] > 2:
+            self.send_response(500); self.end_headers(); return
+        real(self)
+    Fake.do_POST = flaky
+    try:
+        core(tmp_path, "recall", "--reindex")
+    finally:
+        Fake.do_POST = real
+    meta = json.loads(index_files(tmp_path).read_text())
+    assert len(meta["chunks"]) >= 128  # two finished batches of 64 survived
+
+
+def test_citation_line_points_at_the_shown_text(server, tmp_path):
+    notes = {"reference_timesfm.md": "---\nname: timesfm\ndescription: TimesFM is a timeseries foundation model\n---\n\nTimesFM is a timeseries foundation model\n"}
+    setup(tmp_path, server, notes)
+    core(tmp_path, "recall", "--reindex")
+    out = ask(tmp_path, "which forecasting model did I send you")
+    lines = [l for l in out.splitlines() if "reference_timesfm.md" in l]
+    assert len(lines) == 1  # the same sentence isn't shown twice
+    cited = int(lines[0].split("reference_timesfm.md:")[1].split()[0])
+    shown = lines[0].split("  ", 2)[-1].strip()
+    source = (tmp_path / "mem" / "reference_timesfm.md").read_text().splitlines()[cited - 1]
+    assert shown in source  # the line number points at the text actually displayed
+
+
+def test_zero_vectors_fall_back_to_words(server, tmp_path):
+    setup(tmp_path, server, NOTES)
+    core(tmp_path, "recall", "--reindex")
+    real = fake_vec
+    globals()["fake_vec"] = lambda t: [0.0] * DIM
+    try:
+        out = ask(tmp_path, "the ATEM switcher setup")
+    finally:
+        globals()["fake_vec"] = real
+    assert "project_av_chain.md" in out

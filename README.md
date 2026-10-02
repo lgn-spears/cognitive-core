@@ -125,6 +125,9 @@ then `core recall --reindex` once (about a minute for ~3,000 notes; later runs o
 changed, and session start refreshes a stale index in the background). Recall then shows a note when
 its meaning stands out from your whole memory, or stands out moderately *and* the word matcher agrees.
 If the server is down or slow (>1s), recall silently falls back to words — it never blocks a session.
+Requests go straight to `embed_url` and never through a system proxy. **`embed_url` decides where your
+memory goes:** the default is this machine; pointing it at another host sends every message and your
+whole memory there, unencrypted over plain HTTP.
 Measured on 61 real, unseen messages with blind relevance judgments: stays silent 97% of the time when
 nothing is relevant, puts the right note in the top 3 for 77%, and 74% of what it shows is relevant
 (words alone: 90% / 74% / 51%). `tools/eval_recall.py` scores recall against your own labeled messages.

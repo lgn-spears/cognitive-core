@@ -71,14 +71,16 @@ def days_dir() -> Path:
 def decisions_file() -> Path:
     home_dir().mkdir(parents=True, exist_ok=True)
     f = home_dir() / "decisions.log"
-    f.touch(exist_ok=True)
+    if not f.exists():  # touch() on an existing file bumps its mtime (and would look like an edit)
+        f.touch()
     return f
 
 
 def loops_file() -> Path:
     home_dir().mkdir(parents=True, exist_ok=True)
     f = home_dir() / "loops.md"
-    f.touch(exist_ok=True)
+    if not f.exists():  # touch() on an existing file bumps its mtime (and would look like an edit)
+        f.touch()
     return f
 
 
@@ -648,58 +650,89 @@ def embed_config():
     return (model, url) if model else (None, None)
 
 
+EMBED_BATCH = 64
+EMBED_CHECKPOINT_EVERY = 4  # batches; a failure mid-index keeps what finished
+EMBED_OPTIONS = {"num_ctx": 2048}  # chunks are <=1400 chars; a small context keeps the model's memory small
+EMBED_KEEP_ALIVE = "2m"
+
+
 def embed_texts(texts, model, url, timeout):
+    """POST /api/embed directly (never via a system proxy: memory must not leave for anywhere else)."""
     import urllib.request
-    req = urllib.request.Request(url + "/api/embed", data=json.dumps({"model": model, "input": texts}).encode(),
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    body = {"model": model, "input": texts, "options": EMBED_OPTIONS, "keep_alive": EMBED_KEEP_ALIVE}
+    req = urllib.request.Request(url + "/api/embed", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with opener.open(req, timeout=timeout) as resp:
         vecs = json.load(resp)["embeddings"]
+    if len(vecs) != len(texts):
+        raise ValueError("embedding server returned {} vectors for {} inputs".format(len(vecs), len(texts)))
     return [unit(v) for v in vecs]
 
 
+def embed_query(text, model, url, deadline):
+    """Embed one query with a hard wall-clock deadline (covers DNS and trickling servers too)."""
+    box = {}
+
+    def work():
+        try:
+            box["v"] = embed_texts([text], model, url, timeout=deadline)[0]
+        except Exception as e:
+            box["e"] = e
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(deadline)
+    return box.get("v")
+
+
 def unit(v):
-    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    n = math.sqrt(sum(x * x for x in v))
+    if not n or n != n:  # zero or NaN vector: unusable
+        raise ValueError("unusable embedding")
     return [x / n for x in v]
 
 
 def memory_chunks(path: Path):
-    """Paragraph chunks (<=1200 chars), each prefixed with the file's name so the name carries meaning."""
+    """(line, preview, text) chunks of <=1200 chars; text is prefixed with the file's name, and the
+    preview/line point at the line actually worth showing (a description when there is one)."""
     title = re.sub(r"[_\-]+", " ", path.stem)
     lines = path.read_text(errors="replace").splitlines()
-    buf, start = [], None
+    buf = []  # (line_no, text)
     for n, line in enumerate(lines + [""], 1):
         if line.strip() and not LEDGER_NOISE_RE.match(line):
-            if start is None:
-                start = n
-            buf.append(line.strip())
-            if sum(len(b) for b in buf) < 1200:
+            buf.append((n, line.strip()))
+            if sum(len(t) for _, t in buf) < 1200:
                 continue
         if buf:
-            yield start, chunk_preview(buf), "{}: {}".format(title, " ".join(buf))[:1400]
-        buf, start = [], None
+            pn, preview = chunk_preview(buf)
+            yield pn, preview, "{}: {}".format(title, " ".join(t for _, t in buf))[:1400]
+        buf = []
 
 
-def chunk_preview(lines):
-    """The line worth showing: a frontmatter description if present, else the first real line."""
-    for l in lines:
+def chunk_preview(buf):
+    for n, l in buf:
         if l.startswith("description:"):
-            return l[len("description:"):].strip().strip("'\"")[:300]
-    for l in lines:
+            return n, l[len("description:"):].strip().strip("'\"")[:300]
+    for n, l in buf:
         if l != "---" and not re.match(r"^(name|metadata|type|node_type|aliases|originSessionId|modified):", l):
-            return l[:300]
-    return lines[0][:300]
+            return n, l[:300]
+    return buf[0][0], buf[0][1][:300]
 
 
-def index_paths():
-    return home_dir() / "recall-index.json", home_dir() / "recall-index.f32"
+def index_meta_path() -> Path:
+    return home_dir() / "recall-index.json"
 
 
 def load_index(model):
-    """(meta, flat float array) for this model, or (None, None)."""
-    meta_p, vec_p = index_paths()
+    """(meta, flat float array) for this model, or (None, None). Meta names its own vector file, and
+    is replaced last, so a reader never pairs new metadata with old vectors."""
     try:
-        meta = json.loads(meta_p.read_text())
+        meta = json.loads(index_meta_path().read_text())
         if meta.get("model") != model:
+            return None, None
+        vec_p = home_dir() / meta["vecfile"]
+        if "/" in meta["vecfile"] or not vec_p.is_file():  # never open a FIFO or a path elsewhere
             return None, None
         vecs = array.array("f")
         with open(str(vec_p), "rb") as fh:
@@ -709,6 +742,34 @@ def load_index(model):
         return meta, vecs
     except (OSError, ValueError, KeyError, TypeError):
         return None, None
+
+
+def write_index(model, chunks, vecs, files_done):
+    """Atomically publish (chunks, vectors) — vectors first under a fresh name, metadata last."""
+    dim = len(vecs[0]) if vecs else 0
+    flat = array.array("f")
+    for v in vecs:
+        flat.extend(v)
+    home_dir().mkdir(parents=True, exist_ok=True)
+    vecfile = "recall-index-{}.f32".format(os.urandom(4).hex())
+    fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".recall-vec-")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(flat.tobytes())
+    os.replace(tmp, home_dir() / vecfile)
+    try:
+        old = json.loads(index_meta_path().read_text()).get("vecfile")
+    except (OSError, ValueError):
+        old = None
+    meta = {"model": model, "dim": dim, "vecfile": vecfile, "chunks": chunks, "files": files_done}
+    fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".recall-meta-")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(meta, fh)
+    os.replace(tmp, index_meta_path())
+    if old and old != vecfile and "/" not in old:
+        try:
+            (home_dir() / old).unlink()
+        except OSError:
+            pass
 
 
 def reindex() -> int:
@@ -727,66 +788,80 @@ def reindex() -> int:
             d = old_meta["dim"]
             for k, c in enumerate(old_meta["chunks"]):
                 old.setdefault(c["path"], []).append((c, old_vecs[k * d:(k + 1) * d]))
-        files = recall_sources()
-        chunks, vecs, todo, embedded, dim = [], [], [], 0, old_meta["dim"] if old_meta else None
-        for f in files:
+        old_files = old_meta["files"] if old_meta else {}
+        # Plan: (path, mtime-read-BEFORE-content, [(chunk, vec-or-None, text)])
+        plan = []
+        for f in recall_sources():
             key = str(f)
             try:
-                mtime = f.stat().st_mtime
+                mtime = f.stat().st_mtime  # before reading: an edit during the run is caught next time
             except OSError:
                 continue
-            if old_meta and old_meta["files"].get(key) == mtime and key in old:
-                for c, v in old[key]:
-                    chunks.append(c)
-                    vecs.append(v)
+            if old_files.get(key) == mtime and key in old:
+                plan.append((key, mtime, [(c, v, None) for c, v in old[key]]))
             else:
-                for line, preview, text in memory_chunks(f):
-                    chunks.append({"path": key, "line": line, "text": preview})
-                    vecs.append(None)
-                    todo.append((len(chunks) - 1, text))
-        for i in range(0, len(todo), 64):
-            batch = todo[i:i + 64]
-            out = embed_texts([t for _, t in batch], model, url, timeout=600)
-            for (k, _), v in zip(batch, out):
-                vecs[k] = v
-            embedded += len(batch)
-        if vecs and dim is None:
-            dim = len(vecs[0])
-        flat = array.array("f")
-        for v in vecs:
-            flat.extend(v)
-        meta = {"model": model, "dim": dim or 0, "chunks": chunks,
-                "files": {str(f): f.stat().st_mtime for f in files if f.exists()}}
-        meta_p, vec_p = index_paths()
-        home_dir().mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".recall-vec-")
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(flat.tobytes())
-        os.replace(tmp, vec_p)
-        fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".recall-meta-")
-        with os.fdopen(fd, "w") as fh:
-            json.dump(meta, fh)
-        os.replace(tmp, meta_p)
-        print("indexed {} chunks ({} embedded, {} reused)".format(len(chunks), embedded, len(chunks) - embedded))
+                plan.append((key, mtime, [({"path": key, "line": ln, "text": pv}, None, tx)
+                                          for ln, pv, tx in memory_chunks(f)]))
+        todo = [(i, j) for i, (_, _, cs) in enumerate(plan) for j, (_, v, _) in enumerate(cs) if v is None]
+        if not todo and set(old_files) == {k for k, _, _ in plan}:
+            print("index up to date ({} chunks)".format(sum(len(cs) for _, _, cs in plan)))
+            return 0
+
+        def publish():
+            chunks, vecs, files_done = [], [], {}
+            for key, mtime, cs in plan:
+                if all(v is not None for _, v, _ in cs):
+                    files_done[key] = mtime
+                    for c, v, _ in cs:
+                        chunks.append(c)
+                        vecs.append(v)
+            write_index(model, chunks, vecs, files_done)
+            return len(chunks)
+
+        embedded = 0
+        try:
+            for b, start in enumerate(range(0, len(todo), EMBED_BATCH)):
+                batch = todo[start:start + EMBED_BATCH]
+                out = embed_texts([plan[i][2][j][2] for i, j in batch], model, url, timeout=120)
+                for (i, j), v in zip(batch, out):
+                    c, _, tx = plan[i][2][j]
+                    plan[i][2][j] = (c, v, tx)
+                embedded += len(batch)
+                if (b + 1) % EMBED_CHECKPOINT_EVERY == 0:
+                    publish()
+        finally:
+            total = publish()
+        print("indexed {} chunks ({} embedded, {} reused)".format(total, embedded, total - embedded))
         return embedded
 
 
 def index_is_stale() -> bool:
+    """Stale when a memory file was added, removed or edited, or the model changed. Day ledgers are
+    ignored here: every session appends a 'session start' line, which must not trigger a rebuild."""
     model, _ = embed_config()
     if not model:
         return False
-    meta_p, _ = index_paths()
     try:
-        built = meta_p.stat().st_mtime
-    except OSError:
+        meta = json.loads(index_meta_path().read_text())
+    except (OSError, ValueError):
         return True
+    if meta.get("model") != model:
+        return True
+    indexed = meta.get("files", {})
+    with_chunks = {c.get("path") for c in meta.get("chunks", [])}
+    days = home_dir() / "days"
+    current = {}
     for f in recall_sources():
+        if f.parent == days:
+            continue
         try:
-            if f.stat().st_mtime > built:
-                return True
+            st = f.stat()
         except OSError:
             continue
-    return False
+        if st.st_size:  # an empty file has nothing to index; its appearance isn't a change
+            current[str(f)] = st.st_mtime
+    indexed_nonday = {k: v for k, v in indexed.items() if Path(k).parent != days and k in with_chunks}
+    return current != indexed_nonday
 
 
 def refresh_index_in_background() -> None:
@@ -811,12 +886,9 @@ def embedding_hits(text, lexical, limit=RECALL_MAX_HITS):
     meta, flat = load_index(model)
     if not meta or not meta["chunks"]:
         return None
-    try:
-        q = embed_texts([EMBED_INSTRUCTION + text], model, url, timeout=EMBED_QUERY_TIMEOUT)[0]
-    except Exception:
-        return None
+    q = embed_query(EMBED_INSTRUCTION + text, model, url, EMBED_QUERY_TIMEOUT)
     d = meta["dim"]
-    if len(q) != d:
+    if not q or len(q) != d:
         return None
     sims = [sum(map(operator.mul, q, flat[k * d:(k + 1) * d])) for k in range(len(meta["chunks"]))]
     mu = sum(sims) / len(sims)
@@ -829,10 +901,12 @@ def embedding_hits(text, lexical, limit=RECALL_MAX_HITS):
                 and meta["chunks"][k]["path"] in lex_files]
     cands = [(Path(meta["chunks"][k]["path"]), meta["chunks"][k]["line"], meta["chunks"][k]["text"]) for k in ordered]
     cands += [h for h in lexical if str(h[0]) in emb_files_confirmable]
-    out, per = [], {}
+    out, per, shown = [], {}, set()
     for f, n, line in cands:
-        if per.get(str(f), 0) >= 2 or any(str(f) == str(o[0]) and n == o[1] for o in out):
+        sig = (str(f), line.strip().lower())
+        if per.get(str(f), 0) >= 2 or sig in shown or any(str(f) == str(o[0]) and n == o[1] for o in out):
             continue
+        shown.add(sig)
         per[str(f)] = per.get(str(f), 0) + 1
         out.append((f, n, line))
         if len(out) >= limit:
