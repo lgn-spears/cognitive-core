@@ -40,6 +40,7 @@ list_repos() {  # unique repo directories under the roots, one per line
 }
 
 missing_roots() {  # configured roots that don't exist (a typo must never read as "all clear")
+  [ -n "$(conf_values repo_root)" ] || return 0   # the defaults (~/code, ~) are allowed to be absent
   repo_roots | while IFS= read -r root; do
     [ -d "$root" ] || printf '%s\n' "$root"
   done

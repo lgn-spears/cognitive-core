@@ -79,3 +79,31 @@ def test_a_decision_is_recalled_once_not_twice(tmp_path):
     out = run(tmp_path, "recall", stdin=json.dumps(
         {"prompt": "should tidepool go multi-region on fly?"})).stdout
     assert out.count("multi-region rejected") == 1, out
+
+
+def test_default_roots_never_nag_about_a_missing_code_folder(tmp_path):
+    # Defaults are ~/code and ~; most people have no ~/code and never wrote audits.conf.
+    repo = tmp_path / "home" / "proj"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    out = run(tmp_path, "brief").stdout
+    assert "doesn't exist" not in out and "audits.conf" not in out
+
+
+def test_different_non_latin_notes_are_not_merged():
+    import importlib.machinery, importlib.util
+    l = importlib.machinery.SourceFileLoader("core", str(CORE))
+    core = importlib.util.module_from_spec(importlib.util.spec_from_loader("core", l)); l.exec_module(core)
+    assert core.same_text_key("кот любит рыбу") != core.same_text_key("собака любит мясо")
+    assert core.same_text_key("猫") != core.same_text_key("犬")
+
+
+def test_decisions_with_colons_are_neither_merged_nor_duplicated(tmp_path):
+    mem = tmp_path / "home" / ".claude" / "projects" / "p" / "memory"
+    mem.mkdir(parents=True)
+    for i in range(30):
+        (mem / "n{}.md".format(i)).write_text("unrelated note {} about gardening\n".format(i))
+    run(tmp_path, "decision", "staging db: keep nightly snapshots for 30 days")
+    run(tmp_path, "decision", "prod db: keep nightly snapshots for 30 days")
+    out = run(tmp_path, "recall", stdin=json.dumps({"prompt": "how long do we keep nightly db snapshots"})).stdout
+    assert out.count("staging db:") == 1 and out.count("prod db:") == 1, out
