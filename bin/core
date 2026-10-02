@@ -13,6 +13,7 @@ decisions log that preserves WHY, and open loops that resurface until done.
     core day [date]          replay one day's ledger
     core search "query"      search all ledgers
     core recall              (UserPromptSubmit hook) cited memory hits for this message
+    core brief               what needs you right now (read-only audits)
     core close               silently mark activity (stop hooks)
 
 State lives in ~/.core (override with $CORE_HOME). Any harness that can
@@ -29,6 +30,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -711,6 +713,96 @@ def cmd_inbox(args) -> int:
     return 0
 
 
+AUDIT_TIMEOUT = 10
+
+
+def audits_dir() -> Path:
+    override = os.environ.get("CORE_AUDITS_DIR")
+    return Path(override) if override else Path(__file__).resolve().parent.parent / "audits"
+
+
+def audits_conf() -> Path:
+    return home_dir() / "audits.conf"
+
+
+def read_manifest(d: Path):
+    """[(script, heading)] in manifest order. Blank lines and # comments skipped."""
+    try:
+        lines = (d / "MANIFEST").read_text().splitlines()
+    except OSError:
+        return []
+    entries = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        entries.append((parts[0], parts[1].strip() if len(parts) > 1 else parts[0]))
+    return entries
+
+
+def run_audit(path: Path, env: dict, timeout: int):
+    """Run one audit. Returns (findings, error); findings = [(headline, detail)]."""
+    try:
+        proc = subprocess.run(
+            ["bash", str(path)], capture_output=True, text=True, timeout=timeout, env=env
+        )
+    except subprocess.TimeoutExpired:
+        return [], "timed out after {}s".format(timeout)
+    except OSError as e:
+        return [], "failed: {}".format(e)
+    if proc.returncode != 0:
+        tail = proc.stderr.strip().splitlines()
+        return [], "failed: {}".format(tail[-1] if tail else "exit {}".format(proc.returncode))
+    findings = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        head, _, detail = line.partition("\t")
+        findings.append((head.strip(), detail.strip()))
+    return findings, None
+
+
+def render_brief(results) -> str:
+    """results: [(heading, findings, error, script)] in manifest order."""
+    order, groups = [], {}
+    for heading, findings, error, script in results:
+        if heading not in groups:
+            groups[heading] = []
+            order.append(heading)
+        for head, detail in findings:
+            groups[heading].append("  " + head)
+            if detail:
+                groups[heading].append("     " + detail)
+        if error:
+            groups[heading].append("  ! audit {} {}".format(script, error))
+    blocks = ["\n".join([h] + groups[h]) for h in order if groups[h]]
+    if not blocks:
+        return "[core] brief — nothing needs you right now."
+    return "\n\n".join(blocks)
+
+
+def cmd_brief(args) -> int:
+    d = audits_dir()
+    timeout = int(os.environ.get("CORE_AUDIT_TIMEOUT") or AUDIT_TIMEOUT)
+    env = dict(
+        os.environ,
+        CORE_HOME=str(home_dir()),
+        CORE_AUDITS_CONF=str(audits_conf()),
+        CORE_AUDITS_LIB=str(d / "lib.sh"),
+    )
+    results = []
+    for script, heading in read_manifest(d):
+        path = d / script
+        if not path.is_file():
+            results.append((heading, [], "missing", script))
+            continue
+        findings, error = run_audit(path, env, timeout)
+        results.append((heading, findings, error, script))
+    print(render_brief(results))
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="core", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -745,6 +837,9 @@ def main(argv=None) -> int:
 
     p_doctor = sub.add_parser("doctor", help="health check: overdue loops, stale references")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_brief = sub.add_parser("brief", help="what needs you right now (read-only audits)")
+    p_brief.set_defaults(func=cmd_brief)
 
     p_recall = sub.add_parser("recall", help="(UserPromptSubmit hook) cited memory hits for this message")
     p_recall.add_argument("--query", help="search text instead of hook JSON on stdin")

@@ -1,0 +1,2 @@
+# One audit per line: script, then the heading its findings appear under.
+# Order here is the order in the brief. Audits are read-only bash; see lib.sh.
