@@ -74,9 +74,33 @@ it with `core loop add "<promise>"`.
 | `core deliver "text" --source NAME [--key K]` | a background job hands a result to the inbox (same key while pending = same item) |
 | `core inbox` / `core inbox ack <id>` | list undelivered results / mark one as seen |
 | `core brief [--deliver]` | run the read-only audits in `audits/` — repos with no remote, unpushed work, scheduled jobs for work that has ended; `--deliver` puts each audit's findings in the inbox (one item per audit, updated on re-run) |
-
+| `core deliver ... --replace` | same key while pending → update that item's text to this one (what is true now) |
 | `core run NAME [--timeout S] -- CMD...` | run a background job under a lease (no overlap; if the wrapper is killed it kills the job's process group, and a still-alive orphan from a hard kill blocks the next run and keeps alarming), with a timeout that kills its whole process group, recording start/finish/status/last line in `~/.core/heartbeat.json` |
 | `core heartbeat` | alarms for every pass in `~/.core/passes.conf` (`expect NAME every 1d`) that never ran, failed, timed out, was killed, has been running too long, died mid-run, or is overdue (1.5x its interval); unparseable `passes.conf` lines are alarms too; exit 1 when any |
+
+**Audits** are plain bash scripts listed in `audits/MANIFEST`, one finding per output line. Configure in
+`~/.core/audits.conf` (one `key value` per line, `#` comments allowed): `repo_root <dir>` (default `~/code`
+and `~`) and `ended <launchd-label-prefix> [YYYY-MM-DD]` for scheduled jobs that belong to work that's over.
+If git is missing or broken, the audit fails loudly — it never reports "nothing needs you" when it couldn't look.
+
+**Run it every morning (macOS)** — save as `~/Library/LaunchAgents/com.you.core-audits.plist`, then
+`launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.you.core-audits.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.you.core-audits</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/YOU/.local/bin/core</string><string>run</string><string>audits</string><string>--</string>
+    <string>/Users/YOU/.local/bin/core</string><string>brief</string><string>--deliver</string>
+  </array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>7</integer></dict>
+</dict></plist>
+```
+
+and tell the heartbeat to expect it: `echo "expect audits every 1d" >> ~/.core/passes.conf`.
+On Linux, the cron equivalent: `7 8 * * * $HOME/.local/bin/core run audits -- $HOME/.local/bin/core brief --deliver`.
 
 **What the audits don't see (on purpose, or because macOS won't let them):**
 - Repos more than 3 folders below a `repo_root`, and bare repositories, aren't scanned.
@@ -86,9 +110,9 @@ it with `core loop add "<promise>"`.
   couldn't look inside, so you can decide.
 
 **Recall is honest about what it is.** It matches words, weighted by how rare they are in *your* memory,
-and stays silent unless a match is strong. It finds things you name ("the LED wall resolution",
-"herdr", "Branded Bills"); it can't connect meaning across different words ("timesfm" → a note titled
-"time-series foundation models"). `tools/eval_recall.py` scores it against your own labeled messages.
+and stays silent unless a match is strong. It finds things you name (a project, a tool, a client), and stays
+quiet when nothing matches strongly. It can't connect meaning across different words — a question about
+"the forecasting model I sent you" won't find a note titled "time-series foundation models". `tools/eval_recall.py` scores it against your own labeled messages.
 
 **Heartbeats come first.** A schedule is not proof a job ran. `core inject` puts `HEARTBEAT ALARM:` lines
 right under its header, and `core brief` opens with `NOT RUNNING THAT SHOULD BE`.

@@ -23,7 +23,7 @@ them; OPEN LOOPS are promises that still stand.
 | A question gets settled with rationale | `core decision "chose X — because Y"` |
 | You promise future work ("I'll fix CI tomorrow") | `core loop add "fix CI" --due 2026-09-01` |
 | A promise completes | `core loop done "fix CI"` |
-| Advice given that shouldn't repeat daily | `core log "told Logan to sleep"` |
+| Advice given that shouldn't repeat daily | `core log "suggested a break; they kept working"` |
 | A durable fact about the project/human emerges | `core log "prefers plain-English summaries"` |
 
 Do NOT log trivia, intermediate steps, or things already in git/CLAUDE.md.

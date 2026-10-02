@@ -48,10 +48,10 @@ def test_block_mentions_sleep_rule_once():
 def test_block_shows_last_activity_and_journal_tail():
     now = datetime(2026, 8, 22, 23, 40)
     last = now - timedelta(days=3)
-    entries = [{"ts": "2026-08-19T01:10:00", "text": "told Logan to sleep; he kept working"}]
+    entries = [{"ts": "2026-08-19T01:10:00", "text": "suggested a break; they kept working"}]
     block = core_mod.render_block(now, last, entries)
     assert "LAST ACTIVITY" in block and "3 days ago" in block
-    assert "told Logan to sleep" in block
+    assert "suggested a break" in block
 
 
 def test_journal_rotates_to_cap():

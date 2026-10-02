@@ -541,7 +541,7 @@ def recall_search(text: str, files, limit: int = RECALL_MAX_HITS, min_score: flo
 
     - Term weight = IDF over every memory line (not just matching ones): common words count for little.
     - Long lines are discounted, so a paragraph doesn't win by containing many words by chance.
-    - A rare term that names a memory FILE (e.g. "herdr" in project_herdr_setup.md) is strong evidence:
+    - A rare term that names a memory FILE (e.g. "redis" in project_redis.md) is strong evidence:
       that file's best line can surface on that term alone.
     - Nothing is shown below min_score: silence beats noise."""
     terms = recall_terms(text)
