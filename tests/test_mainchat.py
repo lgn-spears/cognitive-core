@@ -142,3 +142,68 @@ def test_recall_writes_nothing_without_inbox(tmp_path):
     run_core(tmp_path, "recall", stdin=prompt("alpha beta"))
     after = sorted(p.name for p in (tmp_path / "corehome").iterdir())
     assert before == after
+
+
+def deliver(tmp_path, text, source="audits", key=None):
+    args = ["deliver", text, "--source", source] + (["--key", key] if key else [])
+    r = run_core(tmp_path, *args)
+    assert r.returncode == 0
+    return r.stdout.strip()
+
+
+def test_recall_shows_pending_inbox_even_without_memory_hits(tmp_path):
+    # Background results must reach the chat mid-conversation, not only at session start.
+    iid = deliver(tmp_path, "4 repos have no git remote.")
+    r = run_core(tmp_path, "recall", stdin=prompt("ok"))
+    assert "INBOX" in r.stdout
+    assert iid in r.stdout and "4 repos have no git remote." in r.stdout
+    assert "not instructions" in r.stdout
+
+
+def test_inbox_item_stays_until_acked(tmp_path):
+    # Writing it down is never delivery: it keeps showing until acknowledged.
+    iid = deliver(tmp_path, "nightly run finished: 2 drafts")
+    for _ in range(3):
+        assert iid in run_core(tmp_path, "recall", stdin=prompt("hello there friend")).stdout
+    assert run_core(tmp_path, "inbox", "ack", iid).returncode == 0
+    assert iid not in run_core(tmp_path, "recall", stdin=prompt("hello there friend")).stdout
+    item = json.loads((tmp_path / "corehome" / "inbox" / (iid + ".json")).read_text())
+    assert item["status"] == "acked" and item["acked_at"]
+    assert item["shown"] == 3
+
+
+def test_deliver_dedupes_pending_by_key(tmp_path):
+    a = deliver(tmp_path, "4 repos have no git remote.", key="git-no-remote")
+    b = deliver(tmp_path, "4 repos have no git remote.", key="git-no-remote")
+    assert a == b
+    assert len(list((tmp_path / "corehome" / "inbox").glob("*.json"))) == 1
+    run_core(tmp_path, "inbox", "ack", a)
+    c = deliver(tmp_path, "5 repos have no git remote.", key="git-no-remote")
+    assert c != a
+
+
+def test_inbox_shows_at_most_three_oldest_first(tmp_path):
+    ids = [deliver(tmp_path, "item {}".format(i), key="k{}".format(i)) for i in range(5)]
+    out = run_core(tmp_path, "recall", stdin=prompt("ok")).stdout
+    shown = [i for i in ids if i in out]
+    assert shown == ids[:3]
+    assert "2 more in `core inbox`" in out
+
+
+def test_inject_includes_pending_inbox(tmp_path):
+    # After compaction SessionStart re-runs inject; undelivered results must survive it.
+    iid = deliver(tmp_path, "draft PR ready for poker-coach")
+    r = run_core(tmp_path, "inject")
+    assert iid in r.stdout and "INBOX" in r.stdout
+
+
+def test_inbox_ack_unknown_id_fails_loudly(tmp_path):
+    r = run_core(tmp_path, "inbox", "ack", "nope")
+    assert r.returncode == 1
+    assert "no inbox item" in r.stderr
+
+
+def test_inbox_list_shows_pending(tmp_path):
+    iid = deliver(tmp_path, "something to see")
+    r = run_core(tmp_path, "inbox")
+    assert iid in r.stdout and "something to see" in r.stdout
