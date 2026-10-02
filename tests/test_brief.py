@@ -395,3 +395,69 @@ def test_brief_deliver_rerun_updates_not_duplicates(tmp_path):
 def test_brief_without_deliver_writes_nothing(tmp_path):
     run_core(tmp_path, "brief", audits_dir=two_audits(tmp_path, "3 repos lonely", "2 jobs"))
     assert not (tmp_path / "corehome").exists()
+
+
+# ---- step-2 final-review fix pass ----
+
+
+def test_non_utf8_audit_output_never_crashes_brief(tmp_path):
+    d = tmp_path / "audits"
+    write_audit(d, "bad.sh", r"printf 'caf\351 finding\n'")
+    write_audit(d, "good.sh", r"printf 'good finding\n'")
+    (d / "MANIFEST").write_text("bad.sh  OPEN, NOBODY WAITING ON ME\ngood.sh  OPEN, NOBODY WAITING ON ME\n")
+    r = run_core(tmp_path, "brief", audits_dir=d)
+    assert r.returncode == 0
+    assert "good finding" in r.stdout and "finding" in r.stdout.split("good finding")[0]
+
+
+def test_bad_timeout_setting_falls_back(tmp_path):
+    d = tmp_path / "audits"
+    write_audit(d, "a.sh", r"printf 'x\n'")
+    (d / "MANIFEST").write_text("a.sh  OPEN, NOBODY WAITING ON ME\n")
+    r = run_core(tmp_path, "brief", audits_dir=d, extra_env={"CORE_AUDIT_TIMEOUT": "abc"})
+    assert r.returncode == 0 and "  x" in r.stdout
+
+
+def test_timed_out_audit_leaves_no_process(tmp_path):
+    d = tmp_path / "audits"
+    marker = "theseus-orphan-{}".format(os.getpid())
+    write_audit(d, "slow.sh", "sleep 30 & wait  # {}".format(marker))
+    (d / "MANIFEST").write_text("slow.sh  OPEN, NOBODY WAITING ON ME\n")
+    run_core(tmp_path, "brief", audits_dir=d, extra_env={"CORE_AUDIT_TIMEOUT": "1"})
+    time.sleep(0.5)
+    left = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.strip()
+    assert left == ""
+
+
+def test_quiet_audit_retires_its_stale_inbox_item(tmp_path):
+    # Once the problem is gone, the inbox must stop telling the agent it exists.
+    d = tmp_path / "audits"
+    write_audit(d, "a.sh", r"printf '5 unpushed\n'")
+    (d / "MANIFEST").write_text("a.sh  OPEN, NOBODY WAITING ON ME\n")
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    assert [i["status"] for i in inbox_items(tmp_path)] == ["pending"]
+    write_audit(d, "a.sh", "exit 0")
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    assert [i["status"] for i in inbox_items(tmp_path)] == ["resolved"]
+    assert "inbox empty" in run_core(tmp_path, "inbox").stdout
+
+
+def test_erroring_audit_keeps_its_inbox_item(tmp_path):
+    d = tmp_path / "audits"
+    write_audit(d, "a.sh", r"printf '5 unpushed\n'")
+    (d / "MANIFEST").write_text("a.sh  OPEN, NOBODY WAITING ON ME\n")
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    write_audit(d, "a.sh", "exit 3")
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    assert [i["status"] for i in inbox_items(tmp_path)] == ["pending"]
+
+
+def test_unpushed_counts_detached_head_commits(tmp_path):
+    root = tmp_path / "code"
+    proj = make_repo(root / "proj", 1)
+    add_remote(proj, tmp_path / "bare" / "proj.git")
+    git(proj, "checkout", "-q", "--detach")
+    commit_more(proj, 2)
+    conf(tmp_path, "repo_root {}\n".format(root))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    assert "  2 unpushed commits in proj." in r.stdout

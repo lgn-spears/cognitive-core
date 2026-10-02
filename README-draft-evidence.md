@@ -11,18 +11,20 @@ Muse and dots both answer "what should I look at right now?" with a cloud
 agent and a token budget. On a developer's machine, most of that answer is
 sitting in `git`, `launchctl`, and the closing lines of yesterday's session.
 
-This is one run, on the author's machine, the day this was written:
+This is one real run on the author's machine, the day this was written. Repo and client names are
+replaced with `<placeholders>`; numbers and wording are exactly what `core brief` printed:
 
 ```
 OPEN, NOBODY WAITING ON ME
   77 commits in 7 repos have no git remote at all.
      Oldest commit is 6 months old. This machine has no backup destination configured.
-  115 unpushed commits in one repo.
+  115 unpushed commits in <repo>.
      Oldest is 3 weeks old.
-  …and 10 more repos with unpushed work.
+  (four more repos listed here)
+  6 more repos have unpushed work (15 commits).
 
 STILL RUNNING, SHOULDN'T BE
-  20 scheduled jobs for a client engagement are still loaded, 10 weeks after that work ended.
+  20 scheduled jobs matching <client-prefix> are still loaded, 10 weeks after that work ended.
      19 of the 20 last exited 0 - they are not erroring, they are succeeding.
 ```
 

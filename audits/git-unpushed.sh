@@ -8,9 +8,9 @@ rows=""
 while IFS= read -r repo; do
   [ -n "$repo" ] || continue
   [ -n "$(git -C "$repo" remote 2>/dev/null)" ] || continue
-  n="$(git -C "$repo" rev-list --branches --not --remotes --count 2>/dev/null)" || continue
+  n="$(git -C "$repo" rev-list HEAD --branches --not --remotes --count 2>/dev/null)" || continue
   [ "${n:-0}" -gt 0 ] || continue
-  first="$(git -C "$repo" log --branches --not --remotes --reverse --format=%ct 2>/dev/null | head -1)"
+  first="$(git -C "$repo" log HEAD --branches --not --remotes --reverse --format=%ct 2>/dev/null | head -1)"
   rows="${rows}${n}	${first}	$(basename "$repo")
 "
 done <<EOF
