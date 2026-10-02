@@ -78,6 +78,18 @@ it with `core loop add "<promise>"`.
 | `core run NAME [--timeout S] -- CMD...` | run a background job under a lease (no overlap; if the wrapper is killed it kills the job's process group, and a still-alive orphan from a hard kill blocks the next run and keeps alarming), with a timeout that kills its whole process group, recording start/finish/status/last line in `~/.core/heartbeat.json` |
 | `core heartbeat` | alarms for every pass in `~/.core/passes.conf` (`expect NAME every 1d`) that never ran, failed, timed out, was killed, has been running too long, died mid-run, or is overdue (1.5x its interval); unparseable `passes.conf` lines are alarms too; exit 1 when any |
 
+**What the audits don't see (on purpose, or because macOS won't let them):**
+- Repos more than 3 folders below a `repo_root`, and bare repositories, aren't scanned.
+- A background job (LaunchAgent / cron) can't read privacy-protected folders — Desktop, Documents,
+  Downloads, iCloud, Dropbox and other cloud folders — unless you grant Full Disk Access to `/bin/bash`
+  in System Settings → Privacy & Security. The audit never skips silently: it names every folder it
+  couldn't look inside, so you can decide.
+
+**Recall is honest about what it is.** It matches words, weighted by how rare they are in *your* memory,
+and stays silent unless a match is strong. It finds things you name ("the LED wall resolution",
+"herdr", "Branded Bills"); it can't connect meaning across different words ("timesfm" → a note titled
+"time-series foundation models"). `tools/eval_recall.py` scores it against your own labeled messages.
+
 **Heartbeats come first.** A schedule is not proof a job ran. `core inject` puts `HEARTBEAT ALARM:` lines
 right under its header, and `core brief` opens with `NOT RUNNING THAT SHOULD BE`.
 

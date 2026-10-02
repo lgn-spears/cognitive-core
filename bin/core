@@ -395,7 +395,12 @@ def doctor_report(now_dt: datetime) -> tuple:
     if len(missing) > 10:
         notes.append("{} more stale references not shown".format(len(missing) - 10))
 
-    # 3. store basics
+    # 3. configured memory dirs that don't exist (recall would silently search nothing there)
+    for v in recall_conf_values("memory_dir"):
+        if not Path(os.path.expanduser(v)).is_dir():
+            issues.append("recall.conf memory_dir does not exist: {}".format(v))
+
+    # 4. store basics
     if not state_file().exists():
         issues.append("no state.json yet — run `core inject` once")
     decisions = recent_decisions()
@@ -477,9 +482,10 @@ def recall_conf_values(key: str):
         return []
     vals = []
     for line in lines:
-        parts = line.strip().split(None, 1)
+        line = re.sub(r"\s+#.*$", "", line).strip()  # trailing comments
+        parts = line.split(None, 1)
         if len(parts) == 2 and parts[0] == key and not parts[0].startswith("#"):
-            vals.append(parts[1].strip())
+            vals.append(parts[1].strip().strip("'\""))  # quoted paths
     return vals
 
 
@@ -763,6 +769,9 @@ def resolve_items(key: str) -> None:
 
 
 def cmd_deliver(args) -> int:
+    if not args.text.strip():
+        print("core deliver: refusing an empty result", file=sys.stderr)
+        return 2
     print(deliver_item(args.text, args.source, args.key or "", args.replace))
     return 0
 
@@ -770,6 +779,9 @@ def cmd_deliver(args) -> int:
 def cmd_inbox(args) -> int:
     if args.inbox_cmd == "ack":
         item_id = args.item_id or ""
+        if not item_id:
+            print("usage: core inbox ack <id>", file=sys.stderr)
+            return 2
         if ITEM_ID_RE.match(item_id):
             with inbox_lock():
                 cur = read_item(inbox_dir() / (item_id + ".json"))

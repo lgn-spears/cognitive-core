@@ -5,7 +5,7 @@
 conf_values() {  # conf_values KEY -> each value on its own line
   local conf="${CORE_AUDITS_CONF:-}"
   [ -n "$conf" ] && [ -f "$conf" ] || return 0
-  awk -v k="$1" '$1 == k { $1 = ""; sub(/^ +/, ""); print }' "$conf"
+  awk -v k="$1" '{ sub(/[ \t]+#.*$/, "") } $1 == k { $1 = ""; sub(/^ +/, ""); gsub(/^["\047]|["\047]$/, ""); print }' "$conf"
 }
 
 expand_home() {

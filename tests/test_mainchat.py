@@ -349,3 +349,35 @@ def test_long_prompts_need_more_overlap(tmp_path):
     out = run_core(tmp_path, "recall", stdin=prompt(long_prompt)).stdout
     assert "a.md:1" not in out
     assert "a.md:2" in out
+
+
+# ---- hardening D ----
+
+def test_inbox_ack_without_id_is_a_usage_error(tmp_path):
+    r = run_core(tmp_path, "inbox", "ack")
+    assert r.returncode == 2 and "usage: core inbox ack <id>" in r.stderr
+
+
+def test_deliver_rejects_empty_text(tmp_path):
+    for empty in ["", "   ", "\n"]:
+        r = run_core(tmp_path, "deliver", empty, "--source", "job")
+        assert r.returncode == 2 and "empty" in r.stderr
+    assert not (tmp_path / "corehome" / "inbox").exists()
+
+
+def test_recall_conf_accepts_quotes_and_comments(tmp_path):
+    mem = tmp_path / "my mem"
+    write_mem(mem, "a.md", "the backup drive is called vault seven\n")
+    h = tmp_path / "corehome"
+    h.mkdir()
+    (h / "recall.conf").write_text('memory_dir "{}"   # my notes\n'.format(mem))
+    r = run_core(tmp_path, "recall", stdin=prompt("what is the backup drive called"))
+    assert "a.md:1" in r.stdout
+
+
+def test_doctor_warns_about_missing_memory_dirs(tmp_path):
+    h = tmp_path / "corehome"
+    h.mkdir()
+    (h / "recall.conf").write_text("memory_dir {}\n".format(tmp_path / "nope"))
+    r = run_core(tmp_path, "doctor")
+    assert "recall.conf memory_dir does not exist: {}".format(tmp_path / "nope") in r.stdout

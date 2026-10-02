@@ -524,3 +524,11 @@ def test_deliver_keeps_finding_detail(tmp_path):
     run_core(tmp_path, "brief", "--deliver", audits_dir=d)
     texts = {i["key"]: i["text"] for i in inbox_items(tmp_path)}
     assert texts["audit:a.sh"] == "3 repos lonely — detail a"
+
+
+def test_audits_conf_trailing_comments(tmp_path):
+    root = tmp_path / "code"
+    make_repo(root / "lonely", 1)
+    conf(tmp_path, "repo_root {}   # where I keep code\n".format(root))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    assert "  1 commit in 1 repo has no git remote at all." in r.stdout
