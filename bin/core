@@ -613,7 +613,7 @@ def same_text_key(line: str) -> str:
     """One recorded fact lands in several files (decisions.log and the day ledger, with different
     date/label prefixes); compare the tail so it is shown once."""
     body = re.sub(r"^\s*\[[^\]]*\]\s*(?:(?:decision|note|loop opened|loop closed):\s+)?", "", line.lower())
-    return re.sub(r"[\W_]+", "", body) or line  # any script; a line with no word characters stays itself
+    return " ".join(body.split())  # exact text in any script; only case and spacing are ignored
 
 
 def display_path(p: Path) -> str:

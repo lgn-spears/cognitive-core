@@ -107,3 +107,16 @@ def test_decisions_with_colons_are_neither_merged_nor_duplicated(tmp_path):
     run(tmp_path, "decision", "prod db: keep nightly snapshots for 30 days")
     out = run(tmp_path, "recall", stdin=json.dumps({"prompt": "how long do we keep nightly db snapshots"})).stdout
     assert out.count("staging db:") == 1 and out.count("prod db:") == 1, out
+
+
+def test_dedupe_keeps_lines_that_differ_in_any_character():
+    import importlib.machinery, importlib.util
+    l = importlib.machinery.SourceFileLoader("core", str(CORE))
+    core = importlib.util.module_from_spec(importlib.util.spec_from_loader("core", l)); l.exec_module(core)
+    k = core.same_text_key
+    for a, b in (("[d] दिल", "[d] दल"), ("[d] ไก่", "[d] ไก"), ("[d] كَتَبَ", "[d] كُتُب"),
+                 ("[d] C++ wins", "[d] C wins"), ("[d] v1.2", "[d] v12"), ("[d] deploy 🚀", "[d] deploy 🐛")):
+        assert k(a) != k(b), (a, b)
+    # the same fact in decisions.log and the day ledger is one line
+    assert k("[2026-10-02] ship it 🚀") == k("[09:00] decision: ship it 🚀")
+    assert k("[2026-10-02] Ship  it") == k("[09:00] decision: ship it")
