@@ -431,6 +431,8 @@ just let like me more my no not now of on one or our out over please really she 
 that the their them then there these they this those to too up us very want was we were what when
 where which while who why will with would yes you your hey hi ok okay thanks thank sure yeah go
 continue next lgtm proceed sounds looks good nice fine alright right
+anything else think make even better something feel feels maybe much work works thing things way
+going great perfect wanna gonna definitely trust create based already
 """.split())
 RECALL_ACK_RE = re.compile(
     r"^\s*(ok(ay)?|thanks?( you)?|thx|yes|yep|no|nope|sure|go( ahead)?|cool|great|perfect|got it)"
@@ -500,43 +502,74 @@ def recall_sources():
     return files
 
 
-def recall_search(text: str, files, limit: int = RECALL_MAX_HITS):
-    """Rank lines by IDF-weighted overlap with the message's terms. Returns [(path, line_no, line)].
+# Confidence bar as a fraction of the best two-term score this corpus allows (2 x log(1+N)).
+# 0.56 was tuned on a real ~18k-line memory (= absolute 11 there); scaling keeps small memories working.
+RECALL_MIN_FRACTION = float(os.environ.get("CORE_RECALL_MIN_FRACTION", "0") or 0) or 0.56
 
-    A line needs at least two of the message's terms: one shared word is coincidence, not recall."""
+
+def norm_stem(p: Path) -> str:
+    return re.sub(r"[^a-z0-9]", "", p.stem.lower())
+
+
+def recall_search(text: str, files, limit: int = RECALL_MAX_HITS, min_score: float = None):
+    """Rank memory lines for a message. Returns [(path, line_no, line)].
+
+    - Term weight = IDF over every memory line (not just matching ones): common words count for little.
+    - Long lines are discounted, so a paragraph doesn't win by containing many words by chance.
+    - A rare term that names a memory FILE (e.g. "herdr" in project_herdr_setup.md) is strong evidence:
+      that file's best line can surface on that term alone.
+    - Nothing is shown below min_score: silence beats noise."""
     terms = recall_terms(text)
-    if len(terms) < 2:
+    if not terms:
         return []
-    # Long messages share two words with almost anything; require ~20% of the terms (2..6).
-    need = max(2, min(6, math.ceil(len(terms) * 0.2)))
     term_set = set(terms)
-    candidates, df = [], {t: 0 for t in terms}
+    corpus = []  # (path, line_no, text, tokens)
+    df = {t: 0 for t in terms}
     for f in files:
         try:
             lines = f.read_text(errors="replace").splitlines()
         except OSError:
             continue
         for n, line in enumerate(lines, 1):
-            present = term_set.intersection(TOKEN_RE.findall(line.lower()))
-            if present:
-                for t in present:
-                    df[t] += 1
-                if len(present) >= need:
-                    candidates.append((f, n, line.strip(), present))
-    if not candidates:
-        return []
-    total = sum(df.values()) or 1
-
-    def score(c):
-        f, _, _, present = c
-        s = sum(math.log(1 + total / df[t]) for t in present)
-        stem = f.stem.lower()
-        if any(t in stem for t in present):
-            s += 1.0
-        return s
-
-    ranked = sorted(candidates, key=lambda c: -score(c))
-    return [(f, n, line) for f, n, line, _ in ranked[:limit]]
+            if not line.strip():
+                continue
+            toks = TOKEN_RE.findall(line.lower())
+            present = term_set.intersection(toks)
+            for t in present:
+                df[t] += 1
+            corpus.append((f, n, line.strip(), present, len(toks)))
+    total = len(corpus) or 1
+    idf = {t: math.log(1 + total / df[t]) for t in terms if df[t]}
+    if min_score is None:
+        min_score = RECALL_MIN_FRACTION * 2 * math.log(1 + total)
+    rare = {t for t in idf if len(t) >= 4 and idf[t] >= math.log(101)}  # in under 1% of lines
+    named = {}  # file -> rare terms found in its name
+    for f in {c[0] for c in corpus}:
+        stem = norm_stem(f)
+        hit = {t for t in rare if re.sub(r"[^a-z0-9]", "", t) in stem}
+        if hit:
+            named[f] = hit
+    need = max(2, min(6, math.ceil(len(terms) * 0.2)))
+    scored = []
+    for f, n, line, present, ntok in corpus:
+        weighted = [t for t in present if t in idf]
+        bonus = named.get(f, set())
+        if len(weighted) < need and not bonus:
+            continue
+        s = sum(idf[t] for t in weighted) + sum(idf[t] for t in bonus)
+        s /= 1 + 0.25 * math.log(1 + ntok / 20)
+        if s >= min_score:
+            scored.append((s, f, n, line))
+    scored.sort(key=lambda x: -x[0])
+    out, per_file = [], {}
+    for s, f, n, line in scored:
+        if per_file.get(f, 0) >= 2:
+            continue
+        per_file[f] = per_file.get(f, 0) + 1
+        out.append((f, n, line))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def display_path(p: Path) -> str:
@@ -565,13 +598,20 @@ def read_hook_prompt(raw: str) -> str:
     return ""
 
 
+def recall_hits(text: str, files):
+    """Exactly what the hook shows for a message: the gates (acknowledgements, non-person messages)
+    plus ranking. The eval harness calls this, so it measures the live behaviour."""
+    if not text or RECALL_ACK_RE.match(text) or NOT_FROM_PERSON_RE.search(text[:400]):
+        return []
+    return recall_search(text, files)
+
+
 def cmd_recall(args) -> int:
     """Never breaks the session: memory and inbox fail independently; always exit 0."""
     hits, inbox = [], []
     try:
         text = args.query or read_hook_prompt(sys.stdin.read() if not sys.stdin.isatty() else "")
-        if text and not RECALL_ACK_RE.match(text) and not NOT_FROM_PERSON_RE.search(text[:400]):
-            hits = recall_search(text, recall_sources())
+        hits = recall_hits(text, recall_sources())
     except Exception:
         hits = []
     try:

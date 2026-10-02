@@ -90,12 +90,21 @@ def test_recall_survives_bad_stdin(tmp_path):
 
 
 def test_recall_caps_hits_and_line_length(tmp_path):
+    # At most 5 hits, at most 2 from any one file (one file must not crowd out the rest).
     mem = tmp_path / "mem"
-    write_mem(mem, "a.md", "".join("alpha beta {} {}\n".format(i, "x" * 400) for i in range(20)))
+    for k in range(4):  # a specific match (3 lines per file) inside an otherwise unrelated memory
+        write_mem(mem, "f{}.md".format(k),
+                  "".join("alpha beta {} {}\n".format(i, "x" * 400) for i in range(3))
+                  + "".join("unrelated filler note {}\n".format(i) for i in range(200)))
     conf(tmp_path, mem)
     r = run_core(tmp_path, "recall", stdin=prompt("alpha beta"))
     hits = [l for l in r.stdout.splitlines() if l.startswith("  ")]
     assert len(hits) == 5
+    per_file = {}
+    for l in hits:
+        name = l.split()[0].rsplit(":", 1)[0]
+        per_file[name] = per_file.get(name, 0) + 1
+    assert max(per_file.values()) <= 2
     assert all(len(l.split("  ", 2)[-1]) <= RECALL_TEXT_MAX for l in hits)
 
 
