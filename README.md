@@ -38,9 +38,15 @@ Python 3.9+ only.
 ```json
 "hooks": {
   "SessionStart": [{ "hooks": [{ "type": "command", "command": "/path/to/core inject", "timeout": 10 }] }],
-  "Stop":         [{ "hooks": [{ "type": "command", "command": "/path/to/core close", "timeout": 10 }] }]
+  "Stop":         [{ "hooks": [{ "type": "command", "command": "/path/to/core close", "timeout": 10 }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/path/to/core recall", "timeout": 5 }] }]
 }
 ```
+
+`core recall` is optional and makes every message recall-aware: it reads the prompt from the hook's
+stdin, searches your memory files with your own words, and prints the best matching lines cited
+`file:line` — plus any background results still waiting for you. It never blocks a session: it
+always exits 0 and stays silent on "ok"/"thanks" turns.
 
 **Any instructions file** (opencode AGENTS.md, Cursor rules, system prompt):
 
@@ -64,6 +70,15 @@ it with `core loop add "<promise>"`.
 | `core search "query"` | search every day's ledger |
 | `core doctor` | health check: overdue loops, stale file references |
 | `core close` | silently mark activity (stop hooks) |
+| `core recall` | (UserPromptSubmit hook) cited memory lines for this message + undelivered results |
+| `core deliver "text" --source NAME [--key K]` | a background job hands a result to the inbox (same key while pending = same item) |
+| `core inbox` / `core inbox ack <id>` | list undelivered results / mark one as seen |
+
+**Delivery rule:** an inbox item is shown at session start and on every message until it is
+acknowledged. Writing a result down is never the same as the person having seen it.
+
+**Recall sources:** `~/.core` ledgers always; plus every `memory_dir <path>` line in
+`~/.core/recall.conf`, defaulting to each `~/.claude/projects/*/memory` directory.
 
 ## Standing orders
 
