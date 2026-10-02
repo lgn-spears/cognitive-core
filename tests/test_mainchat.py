@@ -42,13 +42,13 @@ def prompt(text):
 def test_recall_cites_file_and_line(tmp_path):
     # The point of recall is evidence you can check: every hit says where it came from.
     mem = tmp_path / "mem"
-    write_mem(mem, "project_poker.md", "# Poker\nCoach runs on port 8791 with play money\n")
+    write_mem(mem, "project_garden.md", "# Garden app\nDev server runs on port 4100 with seed data\n")
     conf(tmp_path, mem)
-    r = run_core(tmp_path, "recall", stdin=prompt("what port does the poker coach run on"))
+    r = run_core(tmp_path, "recall", stdin=prompt("what port does the garden app dev server run on"))
     assert r.returncode == 0
     assert "[core] recall" in r.stdout
-    assert "project_poker.md:2" in r.stdout
-    assert "port 8791" in r.stdout
+    assert "project_garden.md:2" in r.stdout
+    assert "port 4100" in r.stdout
 
 
 def test_recall_prefers_rare_terms(tmp_path):
@@ -192,7 +192,7 @@ def test_inbox_shows_at_most_three_oldest_first(tmp_path):
 
 def test_inject_includes_pending_inbox(tmp_path):
     # After compaction SessionStart re-runs inject; undelivered results must survive it.
-    iid = deliver(tmp_path, "draft PR ready for poker-coach")
+    iid = deliver(tmp_path, "draft PR ready for garden-app")
     r = run_core(tmp_path, "inject")
     assert iid in r.stdout and "INBOX" in r.stdout
 
