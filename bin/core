@@ -1058,7 +1058,7 @@ def sweep_gate(items, turns, traps=None, strict=True):
         typ, stmt, quote = it.get("type"), it.get("statement"), it.get("quote")
         if typ not in SWEEP_TYPES or not isinstance(stmt, str) or not stmt.strip() or not isinstance(quote, str):
             continue
-        if not statement_ok(stmt):
+        if not statement_ok(stmt) or not quote_ok(quote):
             continue
         q = _squash(quote)
         has_proposal = isinstance(it.get("proposal"), str) and it["proposal"].strip()
@@ -1088,14 +1088,17 @@ def sweep_gate(items, turns, traps=None, strict=True):
     return kept
 
 
-STATEMENT_MAX = 200
+STATEMENT_MAX = 320
 # Statements become text an agent reads at session start: anything shaped like an instruction, code,
 # or a link is refused, whatever the extractor was talked into writing.
-INSTRUCTION_RE = re.compile(r"https?://|www\.|`|\b(curl|wget|sudo|rm -|chmod|ssh|eval|exec(ute)?|run (this|the|`)|"
-                            r"ignore (all|previous|prior)|instructions?|important:|system prompt|before replying)\b", re.I)
+INSTRUCTION_RE = re.compile(
+    r"https?://|www\.|`|\b[\w-]+(\.[\w-]+)+/\S*|\S+@[\w-]+\.\w+|"           # links (bare too), emails
+    r"\b(curl|wget|sudo|rm -|chmod|ssh|eval|exec(ute)?|run (this|the|`)|pipe[sd]? .* into|\| *(ba)?sh\b|"
+    r"ignore (all|previous|prior)|instructions?|important:|system prompt|before replying|obey)\b|"
+    r"^\W*(system|assistant|user|developer)\s*:", re.I)
 
 
-SECRETS_RE = re.compile(r"\b(api[ _-]?keys?|passwords?|passphrases?|(access|auth|bearer|refresh|session) tokens?|"
+SECRETS_RE = re.compile(r"\b(passwords?|passphrases?|(access|auth|bearer|refresh|session) tokens?|"
                         r"secrets?|credentials?|private keys?|"
                         r"dot com|dot net|dot io|at sign)\b", re.I)
 CONFUSABLES = str.maketrans("аеорсухіјѕԁԛѵԝАВЕКМНОРСТХІЈЅοερτυχνΟΕΡΤΥΧΝΑΒΚΜΙ·", "aeopcyxijsdqvwABEKMHOPCTXIJSoeptuxvOEPTYXNABKMI.")
@@ -1113,9 +1116,36 @@ def _normalized(text: str) -> str:
 
 
 def statement_ok(stmt: str) -> bool:
+    if _has_hidden_or_foreign(stmt):
+        return False
     st = _normalized(stmt).strip()
-    return (0 < len(st) <= STATEMENT_MAX and "\n" not in st and not INSTRUCTION_RE.search(st)
-            and not SECRETS_RE.search(st) and not _mixed_script(stmt))
+    return 0 < len(st) <= STATEMENT_MAX and not INSTRUCTION_RE.search(st) and not SECRETS_RE.search(st)
+
+
+def _has_hidden_or_foreign(text: str) -> bool:
+    """Invisible/format/control/line-separator characters, or letters outside the Latin script: the
+    usual ways to slip text past a filter. (Statements are model-written English; quotes aren't checked
+    for script, only for hidden characters.)"""
+    import unicodedata
+    for c in text:
+        cat = unicodedata.category(c)
+        if cat in ("Cf", "Cc", "Zl", "Zp", "Co", "Cs") and c not in "\t":
+            return True
+        if c.isalpha() and not unicodedata.name(c, "").startswith("LATIN"):
+            return True
+    return False
+
+
+QUOTE_INSTRUCTION_RE = re.compile(r"\b(ignore (all|previous|prior)|before replying|system prompt|obey|"
+                                  r"pipe[sd]? .* into|\| *(ba)?sh\b|curl|wget|sudo)\b|^\W*(system|assistant)\s*:", re.I)
+
+
+def quote_ok(quote: str) -> bool:
+    """The person's words are shown to the agent too: refuse ones carrying instructions or hidden text."""
+    import unicodedata
+    if any(unicodedata.category(c) in ("Cf", "Cc", "Zl", "Zp") and c not in "\t\n" for c in quote):
+        return False
+    return not QUOTE_INSTRUCTION_RE.search(_normalized(quote))
 
 
 def _mixed_script(text: str) -> bool:
@@ -1277,6 +1307,9 @@ def parse_json_reply(content: str):
     return json.loads(content[start:end + 1]) if start >= 0 < end else {}
 
 
+LIMIT_RE = re.compile(r"usage limit|rate limit|api error|overloaded|credit balance", re.I)
+
+
 class ExtractorUnavailable(Exception):
     """The model couldn't be reached (down, offline, rate/usage limit, timeout): pause, never skip content."""
 
@@ -1340,7 +1373,7 @@ def _call_model(prompt, model, url, api="ollama", schema=None, timeout=600, thin
             out = json.loads(r.stdout)
         except ValueError:
             raise ExtractorUnavailable("claude -p: " + one_line(r.stdout, 200))
-        if out.get("is_error"):
+        if out.get("is_error") or LIMIT_RE.search(str(out.get("result", ""))[:300]):
             raise ExtractorUnavailable("claude -p: " + one_line(str(out.get("result")), 200))
         return _require_json(parse_json_reply(out.get("result", "")))
     if api == "openai":
@@ -1353,7 +1386,10 @@ def _call_model(prompt, model, url, api="ollama", schema=None, timeout=600, thin
                 "options": {"temperature": 0, "num_ctx": 16384}, "keep_alive": "2m", "messages": messages}
     req = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     with opener.open(req, timeout=timeout) as resp:
-        reply = json.load(resp)
+        try:
+            reply = json.load(resp)
+        except ValueError:
+            raise ExtractorUnavailable("server reply wasn't JSON (a login page or proxy?)")
     content = reply["choices"][0]["message"]["content"] if api == "openai" else reply["message"]["content"]
     return _require_json(parse_json_reply(content))
 
@@ -1421,7 +1457,8 @@ def sweep_offer_text(item, path, target=None):
     they're the evidence that exposes a made-up statement. With a target, it's framed as an update."""
     head = "Sweep offer (ask before saving; only on an explicit yes): "
     where = " — {}:{}".format(Path(str(path)).stem[:8], item["line"])
-    said = '; they said "{}"'.format(one_line(item["quote"], 110))
+    shown = re.sub(r"https?://\S+|www\.\S+|\b[\w-]+(\.[\w-]+)+/\S*", "[link]", item["quote"])
+    said = '; they said "{}"'.format(one_line(shown, 110))
     if target:
         f, n, was = target
         lead = 'Update memory? {}:{} "{}" → '.format(Path(str(f)).name, n, one_line(was, 50))
@@ -1596,14 +1633,13 @@ def cmd_sweep(args) -> int:
                             "shadow": shadow, "from_line": chunk[0][0], "to_line": chunk[-1][0],
                             "items": items, "raw": raw, "traps": traps})
                 kept_total += len(items)
-                candidates.extend((it, p) for it in items if it["type"] in offer_types)
+                if not shadow:  # shadow mode never builds a backlog that floods in later
+                    state["queue"].extend({"item": it, "path": str(p)} for it in items if it["type"] in offer_types)
                 rec["line"] = chunk[-1][0]
                 rec.get("fails", {}).pop(key, None)
                 _save_sweep_state(state)
             if finished:
                 rec["size"] = size
-            state["queue"].extend({"item": it, "path": str(pp)} for it, pp in candidates)
-            candidates = []
             _save_sweep_state(state)
         if first_run and not sweep_state_path().exists():
             _save_sweep_state(state)
@@ -1634,7 +1670,9 @@ def cmd_sweep(args) -> int:
                 existing.add(key)
                 state["offers"]["n"] += 1
                 offered += 1
-            state["queue"] = keep[-SWEEP_QUEUE_MAX:]
+                state["queue"] = [x for x in state["queue"] if x is not q]
+                _save_sweep_state(state)  # a crash after this can't exceed the cap or lose the rest
+            state["queue"] = keep[:SWEEP_QUEUE_MAX]  # keep is in priority order: corrections survive
             _save_sweep_state(state)
         tail = ", {} chunk(s) failed".format(failed) if failed else ""
         if shadow:
