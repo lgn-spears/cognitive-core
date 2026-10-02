@@ -1062,8 +1062,8 @@ def sweep_gate(items, turns, traps=None, strict=True):
             continue
         q = _squash(quote)
         has_proposal = isinstance(it.get("proposal"), str) and it["proposal"].strip()
-        if len(re.findall(r"\w+", quote)) <= 3 and not has_proposal:
-            continue  # "ok do it" proves a yes, not what was agreed to
+        if (len(re.findall(r"\w+", quote)) <= 3 or is_bare_approval(quote)) and not has_proposal:
+            continue  # "yes go ahead with it" proves a yes, not what was agreed to
         if not q or (len(q) < 2 and not has_proposal) or is_tentative(quote, questions=strict):
             continue
         found = find_quote(quote, turns, line_hint=it.get("line"))
@@ -1081,6 +1081,8 @@ def sweep_gate(items, turns, traps=None, strict=True):
             if not got:
                 continue  # an approval of something the assistant never proposed
             entry["proposal"] = got[1]
+        if not tied_to_evidence(entry["statement"], said, entry.get("proposal", "")):
+            continue  # a statement the person's words (or the accepted proposal) don't support
         seen.add(_squash(said))
         kept.append(entry)
     return kept
@@ -1093,8 +1095,56 @@ INSTRUCTION_RE = re.compile(r"https?://|www\.|`|\b(curl|wget|sudo|rm -|chmod|ssh
                             r"ignore (all|previous|prior)|instructions?|important:|system prompt|before replying)\b", re.I)
 
 
+SECRETS_RE = re.compile(r"\b(api[ _-]?keys?|passwords?|passphrases?|(access|auth|bearer|refresh|session) tokens?|"
+                        r"secrets?|credentials?|private keys?|"
+                        r"dot com|dot net|dot io|at sign)\b", re.I)
+CONFUSABLES = str.maketrans("аеорсухіјѕԁԛѵԝАВЕКМНОРСТХІЈЅοερτυχνΟΕΡΤΥΧΝΑΒΚΜΙ·", "aeopcyxijsdqvwABEKMHOPCTXIJSoeptuxvOEPTYXNABKMI.")
+APPROVAL_WORDS = {"yes", "yeah", "yep", "ok", "okay", "sure", "go", "ahead", "do", "it", "that", "this", "with",
+                  "please", "sounds", "good", "great", "lets", "let", "s", "ship", "send", "fine", "cool", "perfect",
+                  "agreed", "approve", "approved", "the", "a", "and", "then", "just", "now", "one", "option"}
+STOP = {"the", "person", "wants", "want", "prefers", "likes", "that", "this", "with", "they", "their", "them", "and",
+        "for", "from", "should", "will", "would", "about", "into", "have", "has", "been", "are", "was", "were", "not",
+        "never", "always", "uses", "use", "using", "says", "said", "decided", "chose", "approved", "every", "only"}
+
+
+def _normalized(text: str) -> str:
+    import unicodedata
+    return unicodedata.normalize("NFKC", text).translate(CONFUSABLES)
+
+
 def statement_ok(stmt: str) -> bool:
-    return 0 < len(stmt.strip()) <= STATEMENT_MAX and "\n" not in stmt.strip() and not INSTRUCTION_RE.search(stmt)
+    st = _normalized(stmt).strip()
+    return (0 < len(st) <= STATEMENT_MAX and "\n" not in st and not INSTRUCTION_RE.search(st)
+            and not SECRETS_RE.search(st) and not _mixed_script(stmt))
+
+
+def _mixed_script(text: str) -> bool:
+    """Latin letters mixed with lookalike letters in the same word: a classic way to dodge filters."""
+    import unicodedata
+    for word in re.findall(r"\w+", text):
+        scripts = {unicodedata.name(c, "?").split()[0] for c in word if c.isalpha()}
+        if "LATIN" in scripts and len(scripts) > 1:
+            return True
+    return False
+
+
+def _content_words(text: str):
+    return {w for w in re.findall(r"[a-z0-9]+", _normalized(text).lower()) if len(w) >= 4 and w not in STOP}
+
+
+def tied_to_evidence(stmt: str, said: str, proposal: str = "") -> bool:
+    """The statement must be about what was actually said (or the proposal that was accepted)."""
+    sw = _content_words(stmt)
+    if not sw:
+        return True
+    ev = _content_words(said) | _content_words(proposal or "")
+    stems = lambda ws: {w[:5] for w in ws}
+    return bool(stems(sw) & stems(ev))
+
+
+def is_bare_approval(quote: str) -> bool:
+    words = re.findall(r"[a-z']+", quote.lower().replace("'", ""))
+    return len([w for w in words if w not in APPROVAL_WORDS]) < 2
 
 
 def _is_trap(said, line, traps):
@@ -1227,9 +1277,13 @@ def parse_json_reply(content: str):
     return json.loads(content[start:end + 1]) if start >= 0 < end else {}
 
 
+class ExtractorUnavailable(Exception):
+    """The model couldn't be reached (down, offline, rate/usage limit, timeout): pause, never skip content."""
+
+
 def model_json(prompt, model, url, api="ollama", schema=None, timeout=600, think=False):
     """One prompt → the JSON object in the reply. Raises on transport errors, refusals, cut-offs."""
-    return _call_model(prompt, model, url, api=api, schema=schema, timeout=timeout, think=think)
+    return _call_model_bounded(prompt, model, url, api=api, schema=schema, timeout=timeout, think=think)
 
 
 def sweep_extract(turns, model, url, timeout=600, think=False, api="ollama"):
@@ -1237,7 +1291,33 @@ def sweep_extract(turns, model, url, timeout=600, think=False, api="ollama"):
     JSON schema; api 'openai' = any OpenAI-compatible server (mlx_lm, LM Studio, llama.cpp)."""
     prompt = (SWEEP_PROMPT.format(conversation=render_conversation(turns))
               + "\n\nReply with only a JSON object: {\"items\": [...], \"traps\": [...]}")
-    return _items_and_traps(_call_model(prompt, model, url, api=api, schema=SWEEP_SCHEMA, timeout=timeout, think=think))
+    return _items_and_traps(_call_model_bounded(prompt, model, url, api=api, schema=SWEEP_SCHEMA, timeout=timeout, think=think))
+
+
+def _call_model_bounded(prompt, model, url, api="ollama", schema=None, timeout=600, think=False):
+    """_call_model with a hard wall-clock limit (a server that drips bytes resets socket timeouts).
+    Transport problems become ExtractorUnavailable; a bad reply stays a ValueError."""
+    box = {}
+
+    def work():
+        try:
+            box["v"] = _call_model(prompt, model, url, api=api, schema=schema, timeout=timeout, think=think)
+        except Exception as e:
+            box["e"] = e
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout + 5)
+    if t.is_alive():
+        raise ExtractorUnavailable("no reply within {}s".format(timeout))
+    e = box.get("e")
+    if e is None:
+        return box["v"]
+    if isinstance(e, (ValueError, KeyError, IndexError, TypeError)) and not isinstance(e, json.JSONDecodeError):
+        raise e  # the model answered, but not usefully: counts toward skipping this chunk
+    if isinstance(e, json.JSONDecodeError):
+        raise ValueError("model reply wasn't JSON: {}".format(e))
+    raise ExtractorUnavailable(str(e))
 
 
 def _call_model(prompt, model, url, api="ollama", schema=None, timeout=600, think=False):
@@ -1251,14 +1331,17 @@ def _call_model(prompt, model, url, api="ollama", schema=None, timeout=600, thin
                "--mcp-config", json.dumps({"mcpServers": {}}), "--permission-mode", "default",
                "--disable-slash-commands"]
         env = {k: v for k, v in os.environ.items()
-               if not (k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_"))}  # not a child of a live session
+               if not k.startswith("CLAUDE")}  # not a child of a live session (CLAUDECODE, CLAUDE_CODE_*, CLAUDE_PID…)
         r = subprocess.run(cmd, input=messages[0]["content"], capture_output=True, text=True, timeout=timeout,
                            cwd=str(home_dir()), env=env)
         if r.returncode != 0:
-            raise RuntimeError("claude -p failed: " + one_line(r.stderr or r.stdout, 200))
-        out = json.loads(r.stdout)
+            raise ExtractorUnavailable("claude -p failed: " + one_line(r.stderr or r.stdout, 200))
+        try:
+            out = json.loads(r.stdout)
+        except ValueError:
+            raise ExtractorUnavailable("claude -p: " + one_line(r.stdout, 200))
         if out.get("is_error"):
-            raise RuntimeError("claude -p: " + one_line(str(out.get("result")), 200))
+            raise ExtractorUnavailable("claude -p: " + one_line(str(out.get("result")), 200))
         return _require_json(parse_json_reply(out.get("result", "")))
     if api == "openai":
         endpoint = url + "/v1/chat/completions"
@@ -1301,6 +1384,8 @@ SWEEP_CHUNK_CHARS = 9000
 SWEEP_MAX_TRIES = 3         # a chunk that fails this many runs in a row is skipped (and logged)
 SWEEP_OFFERS_PER_DAY = 5    # Muse: "a few times a day at most"; the rest stays in the log
 SWEEP_LOG_MAX = 5 * 1024 * 1024
+SWEEP_MAX_JUDGE = 10       # novelty checks per run
+SWEEP_QUEUE_MAX = 200      # offer candidates waiting for a slot; oldest beyond this are dropped
 OFFER_PRIORITY = {"correction": 0, "preference": 1, "decision": 2, "fact": 3, "loop": 4}
 
 
@@ -1332,17 +1417,18 @@ def chunk_turns(turns, limit=SWEEP_CHUNK_CHARS):
 
 
 def sweep_offer_text(item, path, target=None):
-    """Fits the inbox line (INBOX_TEXT_CHARS) and leads with the rule, so truncation never drops it.
-    With a target memory line, it is framed as an update (old → new), never a parallel note."""
+    """Fits the inbox line and leads with the rule. The person's words are kept whole (up to 110 chars):
+    they're the evidence that exposes a made-up statement. With a target, it's framed as an update."""
     head = "Sweep offer (ask before saving; only on an explicit yes): "
-    where = " — {}:{}".format(display_path(path), item["line"])
+    where = " — {}:{}".format(Path(str(path)).stem[:8], item["line"])
+    said = '; they said "{}"'.format(one_line(item["quote"], 110))
     if target:
         f, n, was = target
-        body = 'Update memory? {}:{} "{}" → "{}"; they said "{}"'.format(
-            display_path(f), n, one_line(was, 70), item["statement"], item["quote"])
+        lead = 'Update memory? {}:{} "{}" → '.format(Path(str(f)).name, n, one_line(was, 50))
     else:
-        body = '[{}] "{}"; they said "{}"'.format(item["type"], item["statement"], item["quote"])
-    return one_line(head + body, INBOX_TEXT_CHARS - len(where)) + where
+        lead = "[{}] ".format(item["type"])
+    room = INBOX_TEXT_CHARS - len(head) - len(lead) - len(said) - len(where) - 2
+    return head + lead + '"{}"'.format(one_line(item["statement"], max(20, room))) + said + where
 
 
 JUDGE_PROMPT = """A memory assistant wants to save one new item. Here are the most related lines already in memory:
@@ -1375,10 +1461,10 @@ def judge_novelty(item, related, model, url, api):
     if verdict == "known":
         return "known", None
     if verdict == "updates":
-        try:
-            return "updates", related[int(v.get("replaces")) - 1]
-        except (TypeError, ValueError, IndexError):
-            return "new", None
+        n = v.get("replaces")
+        if isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= len(related):
+            return "updates", related[n - 1]
+        return "new", None
     return "new", None
 
 
@@ -1390,7 +1476,13 @@ def _load_sweep_state():
     if not isinstance(st, dict):
         return None
     files = st.get("files") if "files" in st else {k: {"line": v} for k, v in st.items() if isinstance(v, int)}
-    return {"files": files if isinstance(files, dict) else {}, "offers": st.get("offers", {})}
+    files = files if isinstance(files, dict) else {}
+    for k, rec in files.items():
+        if isinstance(rec, dict) and rec.get("line") == 10 ** 9:  # old "history before install" marker
+            rec["line"] = _last_line(Path(k)) if Path(k).is_file() else 0
+            rec.pop("size", None)
+    queue = st.get("queue", [])
+    return {"files": files, "offers": st.get("offers", {}), "queue": queue if isinstance(queue, list) else []}
 
 
 def _save_sweep_state(state):
@@ -1443,7 +1535,7 @@ def cmd_sweep(args) -> int:
             return 0
         state = _load_sweep_state()
         first_run = state is None
-        state = state or {"files": {}, "offers": {}}
+        state = state or {"files": {}, "offers": {}, "queue": []}
         files = state["files"]
         start, now_ts = time.monotonic(), time.time()
         due = []
@@ -1460,8 +1552,10 @@ def cmd_sweep(args) -> int:
                 continue  # still active, or nothing new since last time
             due.append((st.st_mtime, p, st.st_size))
         due.sort()  # oldest first: nobody starves behind newer conversations
-        calls, failed, kept_total, candidates = 0, 0, 0, []
+        calls, failed, kept_total, candidates, outage = 0, 0, 0, [], False
         for _, p, size in due:
+            if outage:
+                break
             rec = files.setdefault(str(p), {})
             turns = [t for t in transcript_turns(p) if t[0] > rec.get("line", 0)]
             if not any(r == "user" for _, r, _ in turns):
@@ -1476,6 +1570,12 @@ def cmd_sweep(args) -> int:
                 key = str(chunk[0][0])
                 try:
                     raw, traps = sweep_extract(chunk, model, url, api=api)
+                except ExtractorUnavailable as e:
+                    print("sweep paused — couldn't reach the extractor: {}".format(one_line(str(e), 200)), file=sys.stderr)
+                    failed += 1
+                    outage = True
+                    finished = False
+                    break
                 except Exception as e:
                     tries = rec.setdefault("fails", {}).get(key, 0) + 1
                     rec["fails"][key] = tries
@@ -1502,26 +1602,39 @@ def cmd_sweep(args) -> int:
                 _save_sweep_state(state)
             if finished:
                 rec["size"] = size
+            state["queue"].extend({"item": it, "path": str(pp)} for it, pp in candidates)
+            candidates = []
             _save_sweep_state(state)
         if first_run and not sweep_state_path().exists():
             _save_sweep_state(state)
         offered = 0
-        if not shadow:
+        if not shadow and not outage:
             today = now().strftime("%Y-%m-%d")
             if state["offers"].get("date") != today:
                 state["offers"] = {"date": today, "n": 0}
-            for it, p in sorted(candidates, key=lambda c: OFFER_PRIORITY.get(c[0]["type"], 9)):
-                if state["offers"]["n"] >= per_day:
-                    break
+            queue = sorted(state["queue"], key=lambda q: OFFER_PRIORITY.get(q["item"].get("type"), 9))
+            existing = {it.get("key") for it in read_inbox()}
+            judged, keep = 0, []
+            for q in queue:
+                it, p = q["item"], Path(q["path"])
+                if (state["offers"]["n"] >= per_day or judged >= SWEEP_MAX_JUDGE
+                        or time.monotonic() - start > SWEEP_DEADLINE):
+                    keep.append(q)  # waits for the next run / tomorrow
+                    continue
+                key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()).hexdigest()[:12]
+                if key in existing:
+                    continue  # already offered (pending or answered): never twice
+                judged += 1
                 verdict, target = judge_novelty(it, related_memory(it["statement"]), model, url, api)
                 _sweep_log({"at": now().isoformat(timespec="seconds"), "judged": it["statement"], "verdict": verdict,
                             "target": "{}:{}".format(target[0], target[1]) if target else None})
                 if verdict == "known":
-                    continue  # memory already says this: nothing new to offer
-                key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()).hexdigest()[:12]
+                    continue  # memory already says this
                 deliver_item(sweep_offer_text(it, p, target), "sweep", key, skip_if_acked=True)
+                existing.add(key)
                 state["offers"]["n"] += 1
                 offered += 1
+            state["queue"] = keep[-SWEEP_QUEUE_MAX:]
             _save_sweep_state(state)
         tail = ", {} chunk(s) failed".format(failed) if failed else ""
         if shadow:
