@@ -115,3 +115,106 @@ def test_audits_receive_conf_and_lib_paths(tmp_path):
     conf, lib = r.stdout.splitlines()[1].strip().split("|")
     assert conf == str(tmp_path / "corehome" / "audits.conf")
     assert lib == str(d / "lib.sh")
+
+
+def git(repo, *args, env=None):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
+
+
+def make_repo(path, commits, days_ago=0, branch="main"):
+    path.mkdir(parents=True)
+    git(path, "init", "-q", "-b", branch)
+    ts = int(time.time()) - days_ago * 86400
+    env = dict(
+        os.environ,
+        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com",
+        GIT_AUTHOR_DATE="{} +0000".format(ts), GIT_COMMITTER_DATE="{} +0000".format(ts),
+    )
+    for i in range(commits):
+        (path / "f{}.txt".format(i)).write_text(str(i))
+        git(path, "add", ".")
+        git(path, "commit", "-q", "-m", "c{}".format(i), env=env)
+    return path
+
+
+def add_remote(repo, bare_dir, push=True):
+    subprocess.run(["git", "init", "-q", "--bare", str(bare_dir)], check=True)
+    git(repo, "remote", "add", "origin", str(bare_dir))
+    if push:
+        git(repo, "push", "-q", "origin", "HEAD")
+
+
+def stub(tmp_path, name, body):
+    d = tmp_path / "stubs"
+    write_audit(d, name, body)
+    return d
+
+
+def conf(tmp_path, text):
+    h = tmp_path / "corehome"
+    h.mkdir(exist_ok=True)
+    (h / "audits.conf").write_text(text)
+
+
+NO_TM = "echo 'No destinations configured.'"
+
+
+def test_no_remote_counts_only_repos_without_any_remote(tmp_path):
+    root = tmp_path / "code"
+    make_repo(root / "lonely", 3, days_ago=21)
+    backed = make_repo(root / "backed", 5, days_ago=40)
+    add_remote(backed, tmp_path / "bare" / "backed.git")
+    conf(tmp_path, "repo_root {}\n".format(root))
+    stubs = stub(tmp_path, "tmutil", NO_TM)
+    r = run_core(tmp_path, "brief", path_prefix=stubs)
+    assert "OPEN, NOBODY WAITING ON ME" in r.stdout
+    assert "  3 commits in 1 repo has no git remote at all." in r.stdout
+    assert "     Oldest commit is 3 weeks old. This machine has no backup destination configured." in r.stdout
+
+
+def test_no_remote_omits_backup_note_when_time_machine_is_configured(tmp_path):
+    # The note is a claim about the machine; it must only appear when true.
+    root = tmp_path / "code"
+    make_repo(root / "lonely", 1)
+    conf(tmp_path, "repo_root {}\n".format(root))
+    stubs = stub(tmp_path, "tmutil", "echo 'Name : Backup Disk'")
+    r = run_core(tmp_path, "brief", path_prefix=stubs)
+    assert "  1 commit in 1 repo has no git remote at all." in r.stdout
+    assert "Oldest commit is from today." in r.stdout
+    assert "backup destination" not in r.stdout
+
+
+def test_no_remote_ignores_empty_repo(tmp_path):
+    root = tmp_path / "code"
+    (root / "fresh").mkdir(parents=True)
+    git(root / "fresh", "init", "-q")
+    conf(tmp_path, "repo_root {}\n".format(root))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    assert r.stdout.strip() == "[core] brief — nothing needs you right now."
+
+
+def test_no_remote_handles_spaces_in_paths(tmp_path):
+    root = tmp_path / "My Code"
+    make_repo(root / "Old Client" / "site", 2)
+    conf(tmp_path, "repo_root {}\n".format(root))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    assert "  2 commits in 1 repo has no git remote at all." in r.stdout
+
+
+def test_no_remote_sums_across_repos_and_pluralizes(tmp_path):
+    root = tmp_path / "code"
+    make_repo(root / "a", 2, days_ago=3)
+    make_repo(root / "b", 4, days_ago=100)
+    conf(tmp_path, "repo_root {}\n".format(root))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    assert "  6 commits in 2 repos have no git remote at all." in r.stdout
+    assert "Oldest commit is 3 months old." in r.stdout
+
+
+def test_default_roots_scan_home_code_and_home(tmp_path):
+    # No audits.conf: a new user still gets a real finding on day one (spec §4.1).
+    make_repo(tmp_path / "home" / "code" / "proj", 1)
+    make_repo(tmp_path / "home" / "loose", 1)
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    assert "  2 commits in 2 repos have no git remote at all." in r.stdout
