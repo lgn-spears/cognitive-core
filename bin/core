@@ -1024,15 +1024,28 @@ def transcript_turns(path: Path):
 SWEEP_TYPES = ("decision", "correction", "fact", "preference", "loop")
 # A maybe is never a decision: these mark a quote as a question, hypothetical or brainstorm.
 TENTATIVE_RE = re.compile(r"\b(maybe|perhaps|might|what if|not sure|i wonder|could we|should we|"
-                          r"would it|we could|possibly|thinking about)\b", re.I)  # a "?" alone is often a directive
+                          r"would it|we could|possibly|thinking about|thought about)\b", re.I)  # a "?" alone is often a directive
 QUOTE_MATCH = 0.8  # share of the quote's words that must appear, in order, in what the person typed
+# A "?" is a real question unless it's an instruction wearing one ("this should fill the screen?").
+DIRECTIVE_RE = re.compile(r"\b(should|shouldn't|must|never|always|needs? to|has to|have to|don't|do not|"
+                          r"i want|i'd like|i need)\b", re.I)
+QUESTION_OPENER_RE = re.compile(r"^\W*(does|do|did|is|are|was|were|can|could|would|will|any|anything|what|"
+                                r"how|why|where|when|who|which|so|or|and is|should)\b", re.I)
+
+
+def is_tentative(text: str, questions: bool = True) -> bool:
+    """Maybe-words always; question shapes only when `questions` (the strict mode for weaker models —
+    a strong extractor's own trap list judges "he needs two eyes?" better than this rule)."""
+    if TENTATIVE_RE.search(text):
+        return True
+    return questions and "?" in text and (QUESTION_OPENER_RE.match(text) is not None or not DIRECTIVE_RE.search(text))
 
 
 def _squash(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
-def sweep_gate(items, turns):
+def sweep_gate(items, turns, traps=None, strict=True):
     """Keep only extractions a person could verify: a known type, a statement, and a quote that
     appears verbatim (up to spacing/case) in one of the PERSON's turns — never the assistant's —
     and isn't tentative. The cited line is where the quote really is, not where the model says."""
@@ -1045,20 +1058,46 @@ def sweep_gate(items, turns):
         if typ not in SWEEP_TYPES or not isinstance(stmt, str) or not stmt.strip() or not isinstance(quote, str):
             continue
         q = _squash(quote)
-        if len(q) < 2 or TENTATIVE_RE.search(quote):
+        has_proposal = isinstance(it.get("proposal"), str) and it["proposal"].strip()
+        if not q or (len(q) < 2 and not has_proposal) or is_tentative(quote, questions=strict):
             continue
-        found = find_quote(quote, turns)
+        found = find_quote(quote, turns, line_hint=it.get("line"))
         if not found:
             continue
         line, said = found
-        if _squash(said) in seen or TENTATIVE_RE.search(said):
+        if _squash(said) in seen or is_tentative(said, questions=strict) or _is_trap(said, line, traps or []):
             continue
+        entry = {"type": typ, "statement": " ".join(stmt.split()), "quote": said, "line": line}
+        proposal = it.get("proposal")
+        if isinstance(proposal, str) and proposal.strip():
+            before = [t for t in turns if t[1] == "assistant" and t[0] < line][-1:]  # the reply he answered
+            shown = [(n, r, render_conversation([(n, r, t)]).split(": ", 1)[1]) for n, r, t in before]
+            got = find_quote(proposal, shown, role="assistant", line_hint=before[0][0] if before else None)
+            if not got:
+                continue  # an approval of something the assistant never proposed
+            entry["proposal"] = got[1]
         seen.add(_squash(said))
-        kept.append({"type": typ, "statement": " ".join(stmt.split()), "quote": said, "line": line})
+        kept.append(entry)
     return kept
 
 
-def find_quote(quote, turns):
+def _is_trap(said, line, traps):
+    """The extractor itself judged this passage a question/maybe/brainstorm: never capture it."""
+    s = _squash(said)
+    sw = set(re.findall(r"\w+", s))
+    for t in traps:
+        tq = _squash(t.get("quote", "")) if isinstance(t, dict) else ""
+        if not tq:
+            continue
+        if tq in s or s in tq:
+            return True
+        tw = set(re.findall(r"\w+", tq))
+        if t.get("line") == line and sw and tw and len(sw & tw) >= 0.6 * min(len(sw), len(tw)):
+            return True
+    return False
+
+
+def find_quote(quote, turns, role="user", line_hint=None):
     """(line, the person's exact words) for a quote the model may have tidied (typos fixed, a word
     dropped), or None. Short quotes must match exactly; longer ones need QUOTE_MATCH of their words
     in order within a tight span. The returned evidence is always the person's own text."""
@@ -1066,17 +1105,24 @@ def find_quote(quote, turns):
     qw = [w.lower() for w in re.findall(r"\w+", quote)]
     if not qw:
         return None
-    for n, role, text in turns:
-        if role != "user":
+    if len(qw) <= 3:  # short answers: whole words, in the cited message only
+        pat = re.compile(r"(?<!\w)" + re.escape(" ".join(quote.split())) + r"(?!\w)", re.I)
+        for n, r, text in turns:
+            if r == role and n == line_hint:
+                m = pat.search(" ".join(text.split()))
+                return (n, m.group()) if m else None
+        return None
+    for n, r, text in turns:
+        if r != role:
             continue
         if _squash(quote) in _squash(text):
             i = _squash(text).find(_squash(quote))
             return n, " ".join(text.split())[i:i + len(_squash(quote))]
     if len(qw) <= 3:
-        return None
+        return None  # a short answer ("C", "yes") only counts in the exact message cited (checked above)
     best = None
-    for n, role, text in turns:
-        if role != "user":
+    for n, r, text in turns:
+        if r != role:
             continue
         toks = list(re.finditer(r"\w+", text))
         tw = [m.group().lower() for m in toks]
@@ -1107,8 +1153,27 @@ Capture only:
 Never capture: in-the-moment task chatter, anything only the assistant said, questions, maybes,
 brainstorming or "we could" ideas.
 
+When the person accepts a concrete proposal from the assistant ("yes", "do it", "go with B"), that IS a
+decision: the statement says what was accepted, quote = the person's words of acceptance, and proposal =
+the assistant's words that were accepted, copied exactly from the reply right before.
+
+Also list TRAPS: the person's questions, maybes, hypotheticals and brainstorms that could be mistaken
+for decisions (quote + line). Deciding these explicitly is part of the job.
+
 For each item give: type; statement (one self-contained sentence, third person: "The person ...");
-quote (copied EXACTLY from one of the PERSON's lines, under 200 characters); line (that line's number).
+quote (copied EXACTLY from one of the PERSON's lines, under 200 characters); line (that line's number);
+proposal (only for an accepted proposal, else omit).
+
+Example. Conversation:
+[line 4] ASSISTANT: Two ways to store this: SQLite (one file, zero admin) or Postgres. I'd pick SQLite.
+[line 5] PERSON: sqlite, yes. and stop adding emoji to my commit messages
+[line 7] PERSON: maybe we add caching later?
+Answer: {{"items": [
+ {{"type": "decision", "statement": "The person chose SQLite for storage.", "quote": "sqlite, yes", "line": 5,
+  "proposal": "I'd pick SQLite."}},
+ {{"type": "correction", "statement": "The person wants no emoji in commit messages.",
+  "quote": "stop adding emoji to my commit messages", "line": 5}}]}}
+(Line 7 is a maybe, so it is not captured.)
 
 Conversation:
 {conversation}"""
@@ -1116,8 +1181,11 @@ Conversation:
 SWEEP_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
     "type": "object", "properties": {"type": {"type": "string", "enum": list(SWEEP_TYPES)},
                                      "statement": {"type": "string"}, "quote": {"type": "string"},
-                                     "line": {"type": "integer"}},
-    "required": ["type", "statement", "quote", "line"]}}}, "required": ["items"]}
+                                     "line": {"type": "integer"}, "proposal": {"type": "string"}},
+    "required": ["type", "statement", "quote", "line"]}},
+    "traps": {"type": "array", "items": {"type": "object", "properties": {
+        "quote": {"type": "string"}, "line": {"type": "integer"}}, "required": ["quote", "line"]}}},
+    "required": ["items", "traps"]}
 
 
 def sweep_config():
@@ -1130,7 +1198,9 @@ def render_conversation(turns, reply_chars=1200):
     out = []
     for n, role, text in turns:
         who = "PERSON" if role == "user" else "ASSISTANT"
-        out.append("[line {}] {}: {}".format(n, who, text if role == "user" else text[:reply_chars]))
+        if role != "user" and len(text) > reply_chars:  # proposals and questions live at the end
+            text = text[:reply_chars // 3] + " […] " + text[-(reply_chars * 2 // 3):]
+        out.append("[line {}] {}: {}".format(n, who, text))
     return "\n\n".join(out)
 
 
@@ -1147,7 +1217,7 @@ def sweep_extract(turns, model, url, timeout=600, think=False, api="ollama"):
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # memory never via a proxy
     messages = [{"role": "user", "content": SWEEP_PROMPT.format(conversation=render_conversation(turns))
-                 + "\n\nReply with only a JSON object: {\"items\": [...]}"}]
+                 + "\n\nReply with only a JSON object: {\"items\": [...], \"traps\": [...]}"}]
     if api == "claude":  # Claude Code headless on the person's own subscription: no hooks, no transcript, no tools
         cmd = ["claude", "-p", "--model", model, "--no-session-persistence", "--output-format", "json",
                "--settings", json.dumps({"disableAllHooks": True}), "--tools", ""]
@@ -1155,8 +1225,7 @@ def sweep_extract(turns, model, url, timeout=600, think=False, api="ollama"):
                            cwd=str(home_dir()))
         if r.returncode != 0:
             raise RuntimeError("claude -p failed: " + one_line(r.stderr or r.stdout, 200))
-        data = parse_json_reply(json.loads(r.stdout).get("result", ""))
-        return data.get("items", []) if isinstance(data, dict) else []
+        return _items_and_traps(parse_json_reply(json.loads(r.stdout).get("result", "")))
     if api == "openai":
         endpoint = url + "/v1/chat/completions"
         body = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 4096,
@@ -1169,8 +1238,14 @@ def sweep_extract(turns, model, url, timeout=600, think=False, api="ollama"):
     with opener.open(req, timeout=timeout) as resp:
         reply = json.load(resp)
     content = reply["choices"][0]["message"]["content"] if api == "openai" else reply["message"]["content"]
-    data = parse_json_reply(content)
-    return data.get("items", []) if isinstance(data, dict) else []
+    return _items_and_traps(parse_json_reply(content))
+
+
+def _items_and_traps(data):
+    if not isinstance(data, dict):
+        return [], []
+    items, traps = data.get("items", []), data.get("traps", [])
+    return (items if isinstance(items, list) else []), (traps if isinstance(traps, list) else [])
 
 
 SWEEP_QUIET = 1800          # a conversation is swept once it has been idle this long
@@ -1207,12 +1282,19 @@ def chunk_turns(turns, limit=SWEEP_CHUNK_CHARS):
 
 
 def sweep_offer_text(item, path):
-    text = 'Sweep offer — save to memory? [{}] {} Evidence: they said "{}" ({}:{}).'.format(
-        item["type"], item["statement"], one_line(item["quote"], 200), display_path(path), item["line"])
+    evidence = 'they said "{}" ({}:{})'.format(one_line(item["quote"], 200), display_path(path), item["line"])
+    if item.get("proposal"):
+        evidence += ', answering "{}"'.format(one_line(item["proposal"], 160))
     try:
         related = recall_search(item["statement"], recall_sources(), limit=2)
     except Exception:
         related = []
+    if item["type"] == "correction" and related:
+        f, n, old = related[0]
+        return ('Sweep offer — Update memory? {}:{} says "{}" → {} Evidence: {}. Ask the person; on an '
+                'explicit yes, replace the old line (note what it replaced), never keep both.').format(
+            display_path(f), n, one_line(old, 160), item["statement"], evidence)
+    text = "Sweep offer — save to memory? [{}] {} Evidence: {}.".format(item["type"], item["statement"], evidence)
     if related:
         text += " Possibly superseded by this: " + "; ".join(
             "{}:{}".format(display_path(f), n) for f, n, _ in related) + "."
@@ -1239,7 +1321,11 @@ def cmd_sweep(args) -> int:
         first_run = state is None
         state = state if isinstance(state, dict) else {}
         now_ts = time.time()
-        due, failed, offered = [], 0, 0
+        due, failed, offered, shadow_items = [], 0, 0, 0
+        shadow = (recall_conf_values("sweep_shadow") or ["off"])[-1].lower() in ("on", "yes", "true", "1")
+        # strict: also block anything shaped like a question/maybe (for weaker local models). Off: trust
+        # the extractor's own trap list (strong models judge "he needs two eyes?" better than a regex).
+        strict = (recall_conf_values("sweep_strict") or ["on"])[-1].lower() not in ("off", "no", "false", "0")
         for p in sweep_sources():
             try:
                 mtime = p.stat().st_mtime
@@ -1257,28 +1343,37 @@ def cmd_sweep(args) -> int:
             if not any(r == "user" for _, r, _ in turns):
                 continue
             try:
-                items = []
+                items, raws = [], []
                 for chunk in chunk_turns(turns):
-                    items.extend(sweep_gate(sweep_extract(chunk, model, url, api=api), chunk))
+                    raw, traps = sweep_extract(chunk, model, url, api=api)
+                    raws.append({"from_line": chunk[0][0], "to_line": chunk[-1][0], "raw": raw, "traps": traps})
+                    items.extend(sweep_gate(raw, chunk, traps=traps, strict=strict))
             except Exception as e:
                 print("couldn't sweep {}: {}".format(display_path(p), one_line(str(e), 200)), file=sys.stderr)
                 failed += 1
                 continue
             log = home_dir() / "sweep.log"
             with open(str(log), "a") as fh:
-                for it in items:
-                    fh.write(json.dumps(dict(it, path=str(p), at=now().isoformat(timespec="seconds"))) + "\n")
-            for it in items:
+                fh.write(json.dumps({"at": now().isoformat(timespec="seconds"), "path": str(p), "model": model,
+                                     "shadow": shadow, "items": items, "raw": raws}) + "\n")
+            offer_types = set(" ".join(recall_conf_values("sweep_offer_types")).split()) or set(SWEEP_TYPES)
+            for it in [] if shadow else [i for i in items if i["type"] in offer_types]:
                 key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()).hexdigest()[:12]
                 deliver_item(sweep_offer_text(it, p), "sweep", key, skip_if_acked=True)
                 offered += 1
+            shadow_items += len(items)
             state[str(p)] = turns[-1][0]
             tmp = sweep_state_path().with_suffix(".tmp")
             tmp.write_text(json.dumps(state))
             os.replace(str(tmp), str(sweep_state_path()))
         if first_run and not sweep_state_path().exists():
             sweep_state_path().write_text(json.dumps(state))
-        print("sweep: {} offer(s){}".format(offered, ", {} conversation(s) failed".format(failed) if failed else ""))
+        if shadow:
+            print("sweep (shadow — logged to {}, nothing offered): {} item(s){}".format(
+                display_path(home_dir() / "sweep.log"), shadow_items,
+                ", {} conversation(s) failed".format(failed) if failed else ""))
+        else:
+            print("sweep: {} offer(s){}".format(offered, ", {} conversation(s) failed".format(failed) if failed else ""))
         return 1 if failed else 0
 
 

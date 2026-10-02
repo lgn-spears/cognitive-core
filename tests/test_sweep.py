@@ -196,7 +196,7 @@ def test_sweep_reads_each_part_once(chat, tmp_path):
     run_core(tmp_path, "sweep")
     assert len(FakeChat.calls) == 2
     sent = FakeChat.calls[1]["messages"][0]["content"]
-    assert "renew the domain" in sent and "SQLite" not in sent  # only the new part
+    assert "renew the domain" in sent and "overkill here" not in sent  # only the new part
 
 
 def test_sweep_waits_for_a_quiet_conversation(chat, tmp_path):
@@ -268,3 +268,126 @@ def test_a_directive_phrased_as_a_question_is_kept():
     items = [{"type": "correction", "statement": "On mobile the quote should fill the screen.",
               "quote": "on mobile, this quote should take over the whole screen?", "line": 8}]
     assert len(core.sweep_gate(items, turns)) == 1
+
+
+def test_real_questions_are_never_captured():
+    core = load_core()
+    turns = [(1, "user", "Does herdr have an actual app? so herdr lives inside of cmux?"),
+             (2, "user", "Any other validations that you should run?"),
+             (3, "user", "remove the Rain portions on the bottom to make it flow more easily?")]
+    items = [{"type": "fact", "statement": "herdr lives inside cmux.", "quote": "so herdr lives inside of cmux?", "line": 1},
+             {"type": "fact", "statement": "herdr has an app.", "quote": "Does herdr have an actual app?", "line": 1},
+             {"type": "preference", "statement": "More validations.", "quote": "Any other validations that you should run?", "line": 2},
+             {"type": "decision", "statement": "Remove the Rain portions.", "quote": "remove the Rain portions on the bottom to make it flow more easily?", "line": 3}]
+    assert core.sweep_gate(items, turns) == []
+
+
+def test_approval_of_a_proposal_is_captured_with_both_quotes():
+    # "yes, do that" carries the decision in the assistant's words; the person's words prove the yes.
+    core = load_core()
+    turns = [(10, "assistant", "Three options. I recommend option B: final sale on custom items, 30-day returns on stock."),
+             (11, "user", "yes, go with B")]
+    items = [{"type": "decision", "statement": "Custom items are final sale; stock items have 30-day returns.",
+              "quote": "yes, go with B", "line": 11,
+              "proposal": "final sale on custom items, 30-day returns on stock"}]
+    kept = core.sweep_gate(items, turns)
+    assert len(kept) == 1 and kept[0]["proposal"] == "final sale on custom items, 30-day returns on stock."[:-1]
+
+
+def test_approval_needs_the_proposal_right_before_it():
+    core = load_core()
+    turns = [(10, "assistant", "I recommend option B."), (11, "user", "yes, go with B")]
+    invented = [{"type": "decision", "statement": "x", "quote": "yes, go with B", "line": 11,
+                 "proposal": "delete the production database"}]
+    assert core.sweep_gate(invented, turns) == []
+
+
+def test_long_replies_keep_their_ending_where_proposals_live():
+    core = load_core()
+    reply = "background " * 300 + "Want me to ship the refund policy now?"
+    text = core.render_conversation([(1, "assistant", reply)])
+    assert "ship the refund policy" in text and len(text) < 1600
+
+
+def test_one_letter_answer_to_a_menu_is_an_approval():
+    core = load_core()
+    turns = [(20, "user", "a cat sat on a mat"),
+             (21, "assistant", "Pick one: A — facts only. B — ratings only. C — Both. Facts plus a private seller rating."),
+             (22, "user", "C")]
+    items = [{"type": "decision", "statement": "Buyer signal combines facts with a private seller rating.",
+              "quote": "C", "line": 22, "proposal": "C — Both. Facts plus a private seller rating."}]
+    kept = core.sweep_gate(items, turns)
+    assert len(kept) == 1 and kept[0]["line"] == 22
+
+
+def test_short_quote_must_be_in_the_cited_message():
+    core = load_core()
+    turns = [(20, "user", "a cat sat on a mat"), (21, "assistant", "Pick B?"), (22, "user", "ok")]
+    items = [{"type": "decision", "statement": "x", "quote": "a", "line": 22, "proposal": "Pick B?"}]
+    assert core.sweep_gate(items, turns) == []
+
+
+def test_shadow_mode_logs_but_never_offers(chat, tmp_path):
+    setup_sweep(tmp_path, chat)
+    with open(str(tmp_path / "corehome" / "recall.conf"), "a") as fh:
+        fh.write("sweep_shadow on\n")
+    FakeChat.reply = {"items": [{"type": "correction", "statement": "No emoji in commits.",
+                                 "quote": "never use emoji in commit messages", "line": 3}]}
+    r = run_core(tmp_path, "sweep")
+    assert r.returncode == 0 and "shadow" in r.stdout
+    assert "inbox empty" in run_core(tmp_path, "inbox").stdout
+    log = (tmp_path / "corehome" / "sweep.log").read_text()
+    assert "No emoji in commits." in log and '"raw"' in log  # raw model output kept for later judging
+
+
+def test_only_trusted_types_reach_the_inbox(chat, tmp_path):
+    setup_sweep(tmp_path, chat)
+    with open(str(tmp_path / "corehome" / "recall.conf"), "a") as fh:
+        fh.write("sweep_offer_types fact preference\n")
+    FakeChat.reply = {"items": [
+        {"type": "preference", "statement": "Prefers SQLite for small apps.", "quote": "let's use SQLite", "line": 1},
+        {"type": "correction", "statement": "No emoji in commits.", "quote": "never use emoji in commit messages", "line": 3}]}
+    r = run_core(tmp_path, "sweep")
+    inbox = run_core(tmp_path, "inbox").stdout
+    assert "Prefers SQLite" in inbox and "No emoji" not in inbox  # corrections stay in shadow
+    assert "No emoji" in (tmp_path / "corehome" / "sweep.log").read_text()
+
+
+def test_correction_offer_shows_what_it_would_replace(chat, tmp_path):
+    setup_sweep(tmp_path, chat)
+    mem = tmp_path / "home" / ".claude" / "projects" / "-x" / "memory"
+    mem.mkdir(parents=True)
+    (mem / "commits.md").write_text("Commit messages use emoji prefixes like a rocket for releases\n")
+    for i in range(30):
+        (mem / "n{}.md".format(i)).write_text("unrelated gardening note {}\n".format(i))
+    FakeChat.reply = {"items": [{"type": "correction", "statement": "Never use emoji in commit messages.",
+                                 "quote": "never use emoji in commit messages", "line": 3}]}
+    run_core(tmp_path, "sweep")
+    inbox = run_core(tmp_path, "inbox").stdout
+    assert "Update memory?" in inbox and "commits.md:1" in inbox and "emoji prefixes" in inbox
+
+
+def test_the_models_own_traps_veto_matching_items():
+    # The extractor must also name what it judged tentative; anything it called a trap is never captured.
+    core = load_core()
+    turns = [(1, "user", "we could add a newsletter later, not sure. also the header must be green")]
+    items = [{"type": "decision", "statement": "Add a newsletter.", "quote": "we could add a newsletter later", "line": 1},
+             {"type": "correction", "statement": "Header must be green.", "quote": "the header must be green", "line": 1}]
+    traps = [{"quote": "we could add a newsletter later, not sure", "line": 1}]
+    kept = core.sweep_gate(items, turns, traps=traps, strict=False)
+    assert [k["statement"] for k in kept] == ["Header must be green."]
+
+
+def test_lenient_gate_keeps_a_correction_phrased_as_a_question():
+    core = load_core()
+    turns = [(4, "user", "he needs two eyes? You only gave him one")]
+    items = [{"type": "correction", "statement": "The figure needs two eyes.", "quote": "he needs two eyes? You only gave him one", "line": 4}]
+    assert len(core.sweep_gate(items, turns, traps=[], strict=False)) == 1
+    assert core.sweep_gate(items, turns) == []  # the strict (regex) gate still blocks it, for weak models
+
+
+def test_maybe_words_block_even_in_lenient_mode():
+    core = load_core()
+    turns = [(2, "user", "she has also thought about having a parts section on the site")]
+    items = [{"type": "fact", "statement": "Site will have a parts section.", "quote": "she has also thought about having a parts section", "line": 2}]
+    assert core.sweep_gate(items, turns, traps=[], strict=False) == []
