@@ -1249,6 +1249,11 @@ Capture only:
 Never capture: in-the-moment task chatter, anything only the assistant said, questions, maybes,
 brainstorming or "we could" ideas.
 
+The test for everything: would a session on a DIFFERENT task, weeks from now, be better for knowing it?
+Fixes to the work in progress ("make this headline one line", "this box is too blue") fail that test and
+are not captured; capture a correction only when it states a standing rule or reveals a repeated habit
+("you keep treating mobile as an afterthought", "never use emoji in commits").
+
 When the person accepts a concrete proposal from the assistant ("yes", "do it", "go with B"), that IS a
 decision: the statement says what was accepted, quote = the person's words of acceptance, and proposal =
 the assistant's words that were accepted, copied exactly from the reply right before.
@@ -1282,6 +1287,22 @@ SWEEP_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "ite
     "traps": {"type": "array", "items": {"type": "object", "properties": {
         "quote": {"type": "string"}, "line": {"type": "integer"}}, "required": ["quote", "line"]}}},
     "required": ["items", "traps"]}
+
+
+def sweep_api_key():
+    """Optional key for a hosted OpenAI-compatible extractor: `sweep_key_file <path>` (a file holding the
+    key, or a shell line like `export X=key`), or $SWEEP_API_KEY. Never logged."""
+    if os.environ.get("SWEEP_API_KEY"):
+        return os.environ["SWEEP_API_KEY"].strip()
+    f = (recall_conf_values("sweep_key_file") or [None])[-1]
+    if not f:
+        return None
+    try:
+        text = Path(os.path.expanduser(f)).read_text()
+    except OSError:
+        return None
+    m = re.search(r"=\s*['\"]?([^'\"\s]+)", text) if "=" in text else None
+    return (m.group(1) if m else text.split()[0]).strip() if text.strip() else None
 
 
 def sweep_config():
@@ -1376,15 +1397,19 @@ def _call_model(prompt, model, url, api="ollama", schema=None, timeout=600, thin
         if out.get("is_error") or LIMIT_RE.search(str(out.get("result", ""))[:300]):
             raise ExtractorUnavailable("claude -p: " + one_line(str(out.get("result")), 200))
         return _require_json(parse_json_reply(out.get("result", "")))
-    if api == "openai":
-        endpoint = url + "/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    key = sweep_api_key()
+    if key and api == "openai":
+        headers["Authorization"] = "Bearer " + key
+    if api == "openai":  # a base ending in a version (…/v1, …/paas/v4) gets /chat/completions directly
+        endpoint = url + ("/chat/completions" if re.search(r"/v\d+$", url) else "/v1/chat/completions")
         body = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 4096,
                 "chat_template_kwargs": {"enable_thinking": think}}
     else:
         endpoint = url + "/api/chat"
         body = {"model": model, "stream": False, "format": schema or "json", "think": think,
                 "options": {"temperature": 0, "num_ctx": 16384}, "keep_alive": "2m", "messages": messages}
-    req = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers=headers)
     with opener.open(req, timeout=timeout) as resp:
         try:
             reply = json.load(resp)
