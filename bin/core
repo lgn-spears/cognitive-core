@@ -432,6 +432,9 @@ RECALL_ACK_RE = re.compile(
     re.I,
 )
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:-]*[a-z0-9]|[a-z0-9]")
+NOT_FROM_PERSON_RE = re.compile(
+    r"^\s*(Another Claude session sent a message|<task-notification>|\[SYSTEM NOTIFICATION)|<agent-message",
+)
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]*$")
 
 
@@ -498,6 +501,8 @@ def recall_search(text: str, files, limit: int = RECALL_MAX_HITS):
     terms = recall_terms(text)
     if len(terms) < 2:
         return []
+    # Long messages share two words with almost anything; require ~20% of the terms (2..6).
+    need = max(2, min(6, math.ceil(len(terms) * 0.2)))
     term_set = set(terms)
     candidates, df = [], {t: 0 for t in terms}
     for f in files:
@@ -510,7 +515,7 @@ def recall_search(text: str, files, limit: int = RECALL_MAX_HITS):
             if present:
                 for t in present:
                     df[t] += 1
-                if len(present) >= 2:
+                if len(present) >= need:
                     candidates.append((f, n, line.strip(), present))
     if not candidates:
         return []
@@ -559,7 +564,7 @@ def cmd_recall(args) -> int:
     hits, inbox = [], []
     try:
         text = args.query or read_hook_prompt(sys.stdin.read() if not sys.stdin.isatty() else "")
-        if text and not RECALL_ACK_RE.match(text):
+        if text and not RECALL_ACK_RE.match(text) and not NOT_FROM_PERSON_RE.search(text[:400]):
             hits = recall_search(text, recall_sources())
     except Exception:
         hits = []

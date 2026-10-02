@@ -308,3 +308,35 @@ def test_inbox_ids_come_from_filenames_and_cannot_escape(tmp_path):
     assert not (tmp_path / "corehome" / "escaped.json").exists()
     assert run_core(tmp_path, "inbox", "ack", "evil").returncode == 0
     assert "inbox empty" in run_core(tmp_path, "inbox").stdout
+
+
+# ---- recall tuning from live use ----
+
+AGENT_PROMPTS = [
+    "Another Claude session sent a message:\n<agent-message from=\"x\">alpha beta gamma</agent-message>",
+    "<task-notification>\n<task-id>1</task-id>alpha beta gamma</task-notification>",
+    "[SYSTEM NOTIFICATION - NOT USER INPUT] alpha beta gamma",
+]
+
+
+def test_recall_ignores_agent_and_system_messages(tmp_path):
+    # Recall is for what the person said; a subagent's report is not a question from them.
+    mem = tmp_path / "mem"
+    write_mem(mem, "a.md", "alpha beta gamma\n")
+    conf(tmp_path, mem)
+    for p in AGENT_PROMPTS:
+        assert "[core] recall" not in run_core(tmp_path, "recall", stdin=prompt(p)).stdout
+
+
+def test_long_prompts_need_more_overlap(tmp_path):
+    # In a long message almost any line shares two words; that's coincidence, not memory.
+    mem = tmp_path / "mem"
+    write_mem(mem, "a.md", "real information about the build pipeline\n"
+                           "theseus private repo public version download github\n")
+    conf(tmp_path, mem)
+    long_prompt = ("remember that I want to build the real thing with my real information even if "
+                   "things are in a private repo and then build a version that anybody can download "
+                   "separately that lives in my github repo so the line about the coach makes no sense")
+    out = run_core(tmp_path, "recall", stdin=prompt(long_prompt)).stdout
+    assert "a.md:1" not in out
+    assert "a.md:2" in out
