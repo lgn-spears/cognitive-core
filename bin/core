@@ -786,6 +786,7 @@ def cmd_inbox(args) -> int:
     return 0
 
 
+AUDIT_BASH = "/bin/bash" if os.path.exists("/bin/bash") else "bash"  # the bash users actually have
 AUDIT_TIMEOUT = 30  # git audits over hundreds of repos need headroom; a timeout hides the finding
 
 
@@ -821,7 +822,7 @@ def run_audit(path: Path, env: dict, timeout: int):
     whole process group so nothing it started keeps running."""
     try:
         proc = subprocess.Popen(
-            ["bash", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            [AUDIT_BASH, str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             errors="replace", env=env, start_new_session=True,
         )
     except OSError as e:
@@ -862,9 +863,9 @@ def render_brief(results) -> str:
             groups[heading] = []
             order.append(heading)
         for head, detail in findings:
-            groups[heading].append("  " + head)
+            groups[heading].append("  " + one_line(head, 300))
             if detail:
-                groups[heading].append("     " + detail)
+                groups[heading].append("     " + one_line(detail, 300))
         if error:
             groups[heading].append("  ! audit {} {}".format(script, error))
     blocks = ["\n".join([h] + groups[h]) for h in order if groups[h]]
@@ -905,7 +906,8 @@ def cmd_brief(args) -> int:
         for heading, findings, error, script in results:
             key = "audit:{}".format(script)
             if findings:
-                deliver_item(" · ".join(head for head, _ in findings), "audits", key, replace=True)
+                deliver_item(" · ".join(head + (" — " + detail if detail else "") for head, detail in findings),
+                             "audits", key, replace=True)
             elif not error:
                 resolve_items(key)  # the problem is gone: stop telling the agent it exists
     return 0

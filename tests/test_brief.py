@@ -389,7 +389,7 @@ def test_brief_deliver_rerun_updates_not_duplicates(tmp_path):
     run_core(tmp_path, "brief", "--deliver", audits_dir=two_audits(tmp_path, "3 repos lonely", "2 jobs"))
     run_core(tmp_path, "brief", "--deliver", audits_dir=two_audits(tmp_path, "4 repos lonely", "2 jobs"))
     texts = sorted(i["text"] for i in inbox_items(tmp_path))
-    assert texts == ["2 jobs", "4 repos lonely"]
+    assert texts == ["2 jobs", "4 repos lonely — detail a"]
 
 
 def test_brief_without_deliver_writes_nothing(tmp_path):
@@ -476,3 +476,51 @@ def test_unreadable_folders_are_reported_not_skipped(tmp_path):
         os.chmod(str(root / "Locked"), 0o755)
     assert "  1 commit in 1 repo has no git remote at all." in r.stdout
     assert "  Couldn't look inside 1 folder from here: Locked." in r.stdout
+
+
+# ---- hardening C ----
+
+def test_worktree_counted_once(tmp_path):
+    root = tmp_path / "code"
+    main = make_repo(root / "main", 3)
+    git(main, "worktree", "add", "-q", str(root / "wt"), "-b", "side")
+    conf(tmp_path, "repo_root {}\n".format(root))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    assert "  3 commits in 1 repo has no git remote at all." in r.stdout
+
+
+def test_ended_future_and_invalid_dates_make_no_claim(tmp_path):
+    for bad in ["2999-01-01", "2026-02-31", "yesterday"]:
+        conf(tmp_path, "repo_root {}\nended com.oldclient. {}\n".format(tmp_path / "none", bad))
+        r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "launchctl", LAUNCHCTL))
+        assert "  4 scheduled jobs matching com.oldclient. are still loaded." in r.stdout, bad
+        assert "after that work ended" not in r.stdout, bad
+
+
+def test_duplicate_ended_lines_report_once(tmp_path):
+    conf(tmp_path, "repo_root {}\nended com.oldclient.\nended com.oldclient.\n".format(tmp_path / "none"))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "launchctl", LAUNCHCTL))
+    assert r.stdout.count("scheduled jobs matching com.oldclient.") == 1
+
+
+def test_single_job_grammar(tmp_path):
+    conf(tmp_path, "repo_root {}\nended com.solo.\n".format(tmp_path / "none"))
+    stubs = stub(tmp_path, "launchctl", "printf 'PID\\tStatus\\tLabel\\n-\\t0\\tcom.solo.job\\n'")
+    r = run_core(tmp_path, "brief", path_prefix=stubs)
+    assert "  1 scheduled job matching com.solo. is still loaded." in r.stdout
+    assert "It last exited 0 - it is not erroring, it is succeeding." in r.stdout
+
+
+def test_brief_neutralizes_control_characters(tmp_path):
+    d = tmp_path / "audits"
+    write_audit(d, "a.sh", r"printf '\033[2J\033[31mred finding\tdetail\033[0m\n'")
+    (d / "MANIFEST").write_text("a.sh  OPEN, NOBODY WAITING ON ME\n")
+    r = run_core(tmp_path, "brief", audits_dir=d)
+    assert "\x1b" not in r.stdout and "red finding" in r.stdout
+
+
+def test_deliver_keeps_finding_detail(tmp_path):
+    d = two_audits(tmp_path, "3 repos lonely", "2 jobs")
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    texts = {i["key"]: i["text"] for i in inbox_items(tmp_path)}
+    assert texts["audit:a.sh"] == "3 repos lonely — detail a"

@@ -16,7 +16,7 @@ while IFS= read -r repo; do
   commits=$((commits + n))
   if [ -z "$oldest" ] || [ "$first" -lt "$oldest" ]; then oldest="$first"; fi
 done <<EOF
-$(list_repos)
+$(unique_repos)
 EOF
 
 blocked="$(unreadable_dirs)"

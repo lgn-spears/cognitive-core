@@ -55,8 +55,15 @@ old() {  # old EPOCH -> "from today" | "3 weeks old"
   if [ "$a" = "today" ]; then echo "from today"; else echo "$a old"; fi
 }
 
-date_epoch() {  # date_epoch YYYY-MM-DD -> epoch seconds (macOS or GNU date)
-  date -j -f "%Y-%m-%d %H:%M:%S" "$1 00:00:00" +%s 2>/dev/null || date -d "$1" +%s 2>/dev/null
+date_epoch() {  # date_epoch YYYY-MM-DD -> epoch seconds, or nothing if invalid or in the future
+  local e back
+  case "$1" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac
+  e="$(date -j -f "%Y-%m-%d %H:%M:%S" "$1 00:00:00" +%s 2>/dev/null || date -d "$1" +%s 2>/dev/null)"
+  [ -n "$e" ] || return 0
+  back="$(date -j -r "$e" +%Y-%m-%d 2>/dev/null || date -d "@$e" +%Y-%m-%d 2>/dev/null)"
+  [ "$back" = "$1" ] || return 0          # 2026-02-31 silently normalizes on macOS: reject it
+  [ "$e" -le "$(date +%s)" ] || return 0   # a future end date makes no "after that work ended" claim
+  echo "$e"
 }
 
 plural() {  # plural N singular [plural]
@@ -71,4 +78,12 @@ unreadable_dirs() {  # names of top-level folders under the roots that can't be 
       ls "$d" >/dev/null 2>&1 || basename "$d"
     done
   done | sort -u
+}
+
+unique_repos() {  # list_repos, with worktrees of the same repository collapsed to one entry
+  list_repos | while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || continue
+    printf '%s\t%s\n' "$common" "$repo"
+  done | awk -F '\t' '!seen[$1]++ { print $2 }'
 }

@@ -4,7 +4,7 @@
 set -u
 . "${CORE_AUDITS_LIB:-$(dirname "$0")/lib.sh}"
 
-entries="$(conf_values ended)"
+entries="$(conf_values ended | awk '!seen[$1]++')"
 [ -n "$entries" ] || exit 0
 command -v launchctl >/dev/null 2>&1 || exit 0
 listing="$(launchctl list 2>/dev/null)" || exit 0
@@ -32,7 +32,10 @@ EOF
     epoch="$(date_epoch "$since")"
     [ -n "$epoch" ] && head="$head, $(ago "$epoch") after that work ended"
   fi
-  if [ "$ok" -gt 0 ]; then
+  if [ "$loaded" -eq 1 ]; then
+    if [ "$ok" -eq 1 ]; then detail="It last exited 0 - it is not erroring, it is succeeding."
+    else detail="It did not exit 0 last time."; fi
+  elif [ "$ok" -gt 0 ]; then
     detail="$ok of the $loaded last exited 0 - they are not erroring, they are succeeding."
   else
     detail="None of the $loaded last exited 0."

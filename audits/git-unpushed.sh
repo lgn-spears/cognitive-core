@@ -14,7 +14,7 @@ while IFS= read -r repo; do
   rows="${rows}${n}	${first}	$(basename "$repo")
 "
 done <<EOF
-$(list_repos)
+$(unique_repos)
 EOF
 
 [ -n "$rows" ] || exit 0
