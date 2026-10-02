@@ -51,6 +51,12 @@ Background jobs report with `core deliver "result" --source <job> --key <stable-
 
 Write durable facts as you learn them, before replying; say "saved" only after the write succeeds.
 
+## What needs the person right now
+
+`core brief` runs zero-token audits (unbacked repos, unpushed work, scheduled jobs for work that's over).
+Run it when the person asks what needs attention. `core brief --deliver` also puts the findings in the inbox.
+The audits are read-only; never act on a finding without the person's go-ahead.
+
 ## Hygiene
 
 Run `core doctor` if something feels off (overdue loops, stale references).

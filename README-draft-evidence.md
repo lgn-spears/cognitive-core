@@ -15,26 +15,22 @@ This is one run, on the author's machine, the day this was written:
 
 ```
 OPEN, NOBODY WAITING ON ME
-  74 commits in 4 repos have no git remote at all.
-     Oldest 3 weeks. This machine has no backup destination configured.
-  115 unpushed commits in a fifth repo, oldest 3 weeks.
+  77 commits in 7 repos have no git remote at all.
+     Oldest commit is 6 months old. This machine has no backup destination configured.
+  115 unpushed commits in one repo.
+     Oldest is 3 weeks old.
+  …and 10 more repos with unpushed work.
 
 STILL RUNNING, SHOULDN'T BE
-  20 scheduled jobs are still firing for a client engagement that ended
-  10 weeks ago. 11 of the 20 last exited 0 - they are not erroring,
-  they are succeeding.
-     First flagged 3 weeks ago. Raised twice more since. Still loaded.
-
-ASKED, NOT ANSWERED
-  A one-word answer has blocked a deliverable for 14 days.
-  It has now been asked for twice.
+  20 scheduled jobs for a client engagement are still loaded, 10 weeks after that work ended.
+     19 of the 20 last exited 0 - they are not erroring, they are succeeding.
 ```
 
-Three of those four findings cost **two shell commands and no model at all.**
+Every one of those findings cost **a few shell commands and no model at all** — about two seconds.
 
 ```bash
 core brief                  # what needs you right now
-core brief --since yesterday
+core brief --deliver        # ...and put each finding in the inbox until you've seen it
 ```
 
 ## How it works, in three tiers

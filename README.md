@@ -73,6 +73,10 @@ it with `core loop add "<promise>"`.
 | `core recall` | (UserPromptSubmit hook) cited memory lines for this message + undelivered results |
 | `core deliver "text" --source NAME [--key K]` | a background job hands a result to the inbox (same key while pending = same item) |
 | `core inbox` / `core inbox ack <id>` | list undelivered results / mark one as seen |
+| `core brief [--deliver]` | run the read-only audits in `audits/` — repos with no remote, unpushed work, scheduled jobs for work that has ended; `--deliver` puts each audit's findings in the inbox (one item per audit, updated on re-run) |
+
+**Audits** are plain bash scripts listed in `audits/MANIFEST`, one finding per output line. Configure in
+`~/.core/audits.conf`: `repo_root <dir>` (default `~/code` and `~`) and `ended <launchd-label-prefix> [YYYY-MM-DD]`.
 
 **Delivery rule:** an inbox item is shown at session start and on every message until it is
 acknowledged. Writing a result down is never the same as the person having seen it.
