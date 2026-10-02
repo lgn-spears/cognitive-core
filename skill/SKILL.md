@@ -57,6 +57,12 @@ Write durable facts as you learn them, before replying; say "saved" only after t
 Run it when the person asks what needs attention. `core brief --deliver` also puts the findings in the inbox.
 The audits are read-only; never act on a finding without the person's go-ahead.
 
+## Heartbeat alarms
+
+`HEARTBEAT ALARM:` lines mean a background job that should have run didn't, failed, or died mid-run.
+Tell the person first, plainly, before anything else. Never assume a scheduled job ran because it was
+scheduled. Wrap background jobs as `core run NAME -- CMD` so their runs are recorded.
+
 ## Hygiene
 
 Run `core doctor` if something feels off (overdue loops, stale references).

@@ -13,6 +13,8 @@ decisions log that preserves WHY, and open loops that resurface until done.
     core day [date]          replay one day's ledger
     core search "query"      search all ledgers
     core recall              (UserPromptSubmit hook) cited memory hits for this message
+    core run NAME -- CMD     run a background job with a lease, timeout, heartbeat record
+    core heartbeat           alarms for expected passes that never ran / failed / hung / overdue
     core brief               what needs you right now (read-only audits)
     core close               silently mark activity (stop hooks)
 
@@ -232,10 +234,13 @@ def cmd_inject(args) -> int:
             last_seen = datetime.fromisoformat(state["last_seen"])
         except ValueError:
             last_seen = None
-    print(render_block(
+    block = render_block(
         now_dt, last_seen, state["journal"], count_today(now_dt),
         loops=open_loops(), decisions=recent_decisions(), orders=standing_orders(),
-    ))
+    )
+    head, _, rest = block.partition("\n")
+    alarm_lines = ["HEARTBEAT ALARM: {}".format(a) for a in safe_alarms()]
+    print("\n".join([head] + alarm_lines + ([rest] if rest else [])))
     try:  # a bad inbox item must never break session start
         inbox = pending_inbox()
         for line in render_inbox(inbox):
@@ -844,7 +849,17 @@ def cmd_brief(args) -> int:
             continue
         findings, error = run_audit(path, env, timeout)
         results.append((heading, findings, error, script))
-    print(render_brief(results))
+    alarms = safe_alarms()
+    body = render_brief(results)
+    if alarms:
+        print("NOT RUNNING THAT SHOULD BE")
+        for a in alarms:
+            print("  " + a)
+        if not body.startswith("[core] brief — nothing"):
+            print()
+            print(body)
+    else:
+        print(body)
     if getattr(args, "deliver", False):
         for heading, findings, error, script in results:
             key = "audit:{}".format(script)
@@ -853,6 +868,175 @@ def cmd_brief(args) -> int:
             elif not error:
                 resolve_items(key)  # the problem is gone: stop telling the agent it exists
     return 0
+
+
+HEARTBEAT_GRACE = 1.5  # overdue when the last finish is older than 1.5 x the expected interval
+RUN_TIMEOUT = 3600
+DURATION_RE = re.compile(r"^(\d+)([mhd])$")
+DURATION_SECONDS = {"m": 60, "h": 3600, "d": 86400}
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, blocking: bool = True):
+    """flock on path. Yields True when held; with blocking=False yields False if someone else holds it.
+    The OS drops the lock when the holder dies, so a crashed job never leaves a stale lease."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path), "a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except (BlockingIOError, PermissionError):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def lease_path(name: str) -> Path:
+    return home_dir() / "leases" / (name + ".lock")
+
+
+def lease_held(name: str) -> bool:
+    p = lease_path(name)
+    if not p.exists():
+        return False
+    with file_lock(p, blocking=False) as got:
+        return not got
+
+
+def read_heartbeats() -> dict:
+    try:
+        data = json.loads((home_dir() / "heartbeat.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def record_heartbeat(name: str, rec: dict) -> None:
+    with file_lock(home_dir() / "heartbeat.lock"):
+        data = read_heartbeats()
+        data[name] = rec
+        fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".heartbeat-")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, home_dir() / "heartbeat.json")
+
+
+def run_command(cmd, timeout: int):
+    """Run cmd in its own process group; echo its output. Returns (status, exit_code, last_line)."""
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                errors="replace", start_new_session=True)
+    except OSError as e:
+        return "failed", 127, one_line("could not start {}: {}".format(cmd[0] if cmd else "(nothing)", e), 200)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.communicate()
+        return "timeout", 124, "timed out after {}s".format(timeout)
+    if out:
+        sys.stdout.write(out)
+    lines = [l for l in out.splitlines() if l.strip()]
+    last = one_line(lines[-1], 200) if lines else ""
+    return ("ok" if proc.returncode == 0 else "failed"), proc.returncode, last
+
+
+def cmd_run(args) -> int:
+    name, cmd, timeout = args.name, list(args.command), args.timeout
+    # argparse.REMAINDER swallows options after NAME; accept `--timeout N` / `--timeout=N` there too.
+    while cmd and cmd[0].startswith("--timeout"):
+        opt = cmd.pop(0)
+        value = opt.split("=", 1)[1] if "=" in opt else (cmd.pop(0) if cmd else "")
+        try:
+            timeout = max(1, int(value))
+        except ValueError:
+            print("core run: --timeout needs a number of seconds", file=sys.stderr)
+            return 2
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not ITEM_ID_RE.match(name) or not cmd:
+        print("usage: core run NAME [--timeout S] -- COMMAND...", file=sys.stderr)
+        return 2
+    with file_lock(lease_path(name), blocking=False) as got:
+        if not got:
+            print("skipped: {} is already running".format(name))
+            return 0
+        started = now().isoformat(timespec="seconds")
+        record_heartbeat(name, {"status": "running", "started": started, "pid": os.getpid(), "last_line": ""})
+        status, code, last = run_command(cmd, timeout)
+        record_heartbeat(name, {"status": status, "exit": code, "started": started,
+                                "finished": now().isoformat(timespec="seconds"), "last_line": last})
+        return code
+
+
+def read_expectations():
+    """[(name, seconds, text)] from passes.conf lines `expect NAME every <n>[mhd]`; bad lines skipped."""
+    try:
+        lines = (home_dir() / "passes.conf").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 4 and parts[0] == "expect" and parts[2] == "every" and ITEM_ID_RE.match(parts[1]):
+            m = DURATION_RE.match(parts[3])
+            if m and int(m.group(1)) > 0:
+                out.append((parts[1], int(m.group(1)) * DURATION_SECONDS[m.group(2)], parts[3]))
+    return out
+
+
+def parse_time(value):
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.astimezone()
+
+
+def heartbeat_alarms():
+    """One line per pass that never ran, failed, timed out, died mid-run, or is overdue."""
+    alarms, recs, now_dt = [], read_heartbeats(), now()
+    for name, seconds, every in read_expectations():
+        rec = recs.get(name)
+        started = parse_time(rec.get("started")) if rec else None
+        if not started:
+            alarms.append("{} has never run (expected every {})".format(name, every))
+            continue
+        status, last = rec.get("status"), one_line(str(rec.get("last_line") or ""), 200)
+        if status == "running":
+            if not lease_held(name):
+                alarms.append("{} started {} and never finished".format(name, human_gap(now_dt - started)))
+            continue
+        finished = parse_time(rec.get("finished")) or started
+        if status in ("failed", "timeout"):
+            verb = "failed" if status == "failed" else "timed out"
+            alarms.append("{} {} {}{}".format(name, verb, human_gap(now_dt - finished),
+                                              ": " + last if last else ""))
+            continue
+        if (now_dt - finished).total_seconds() > seconds * HEARTBEAT_GRACE:
+            alarms.append("{} last finished {} (expected every {})".format(
+                name, human_gap(now_dt - finished), every))
+    return alarms
+
+
+def safe_alarms():
+    try:
+        return heartbeat_alarms()
+    except Exception:
+        return []
+
+
+def cmd_heartbeat(args) -> int:
+    alarms = safe_alarms()
+    for a in alarms:
+        print(a)
+    return 1 if alarms else 0
+
 
 
 def main(argv=None) -> int:
@@ -889,6 +1073,15 @@ def main(argv=None) -> int:
 
     p_doctor = sub.add_parser("doctor", help="health check: overdue loops, stale references")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_run = sub.add_parser("run", help="run a background job with a lease, timeout, and heartbeat record")
+    p_run.add_argument("name")
+    p_run.add_argument("--timeout", type=int, default=RUN_TIMEOUT)
+    p_run.add_argument("command", nargs=argparse.REMAINDER)
+    p_run.set_defaults(func=cmd_run)
+
+    p_hb = sub.add_parser("heartbeat", help="alarms for expected passes that never ran, failed, hung, or are overdue")
+    p_hb.set_defaults(func=cmd_heartbeat)
 
     p_brief = sub.add_parser("brief", help="what needs you right now (read-only audits)")
     p_brief.add_argument("--deliver", action="store_true", help="also put each audit's findings in the inbox")
