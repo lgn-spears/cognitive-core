@@ -269,3 +269,63 @@ def test_name_typo_is_pointed_out(tmp_path):
     put_record(tmp_path, "audit", status="ok", exit=0, started=ago(hours=1), finished=ago(hours=1), last_line="")
     out = run_core(tmp_path, "heartbeat").stdout
     assert "audits has never run (expected every 1d; recorded but not expected: audit)" in out
+
+
+# ---- hardening B: no silent paths ----
+
+def ahead(**kw):
+    return (datetime.now().astimezone() + timedelta(**kw)).isoformat(timespec="seconds")
+
+
+def test_future_finish_alarms(tmp_path):
+    # A record "finished in the future" would never go overdue: that's a silent path.
+    passes(tmp_path, "expect audits every 1d\n")
+    put_record(tmp_path, "audits", status="ok", exit=0, started=ahead(days=3000), finished=ahead(days=3000),
+               last_line="")
+    r = run_core(tmp_path, "heartbeat")
+    assert r.returncode == 1 and "audits has a run record dated in the future" in r.stdout
+
+
+def test_unknown_status_alarms(tmp_path):
+    passes(tmp_path, "expect audits every 1d\n")
+    put_record(tmp_path, "audits", status="weird", started=ago(hours=1), finished=ago(hours=1), last_line="")
+    r = run_core(tmp_path, "heartbeat")
+    assert r.returncode == 1 and "audits has an unrecognized status: weird" in r.stdout
+
+
+def test_zero_or_negative_timeout_clamped_in_both_positions(tmp_path):
+    for args in (["run", "--timeout", "0", "z", "--", "echo", "hi"],
+                 ["run", "z", "--timeout", "-5", "--", "echo", "hi"]):
+        r = run_core(tmp_path, *args)
+        assert r.returncode == 0 and "hi" in r.stdout, args
+        assert records(tmp_path)["z"]["status"] == "ok"
+
+
+def test_unwritable_state_still_runs_job(tmp_path):
+    h = tmp_path / "corehome"
+    h.mkdir()
+    os.chmod(str(h), 0o500)
+    try:
+        r = run_core(tmp_path, "run", "w", "--", "echo", "job ran")
+    finally:
+        os.chmod(str(h), 0o755)
+    assert "job ran" in r.stdout
+    assert r.returncode == 0
+    assert "WARNING" in r.stderr and "Traceback" not in r.stderr
+
+
+def test_heartbeat_check_never_takes_the_lease(tmp_path):
+    # The checker must not briefly hold a job's lease (a run starting that instant would be skipped).
+    passes(tmp_path, "expect audits every 1d\n")
+    put_record(tmp_path, "audits", status="running", started=ago(minutes=1), pid=999999, pgid=999999,
+               last_line="")
+    lease = tmp_path / "corehome" / "leases" / "audits.lock"
+    lease.parent.mkdir(parents=True, exist_ok=True)
+    lease.write_text("")
+    os.chmod(str(lease), 0o000)  # any attempt to open it would fail loudly
+    try:
+        r = run_core(tmp_path, "heartbeat")
+    finally:
+        os.chmod(str(lease), 0o644)
+    assert "Traceback" not in r.stderr
+    assert "audits started 1 min ago and never finished" in r.stdout

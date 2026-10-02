@@ -938,12 +938,19 @@ def lease_path(name: str) -> Path:
     return home_dir() / "leases" / (name + ".lock")
 
 
-def lease_held(name: str) -> bool:
-    p = lease_path(name)
-    if not p.exists():
+def wrapper_alive(rec: dict) -> bool:
+    """Is the `core run` that wrote this record still alive? Checked by pid, never by taking the
+    lease: probing the lock would make a run starting at that instant skip itself."""
+    pid = rec.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
         return False
-    with file_lock(p, blocking=False) as got:
-        return not got
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def read_heartbeats() -> dict:
@@ -1030,7 +1037,7 @@ def group_alive(pgid) -> bool:
 
 
 def cmd_run(args) -> int:
-    name, cmd, timeout = args.name, list(args.command), args.timeout
+    name, cmd, timeout = args.name, list(args.command), max(1, args.timeout)
     # argparse.REMAINDER swallows options after NAME; accept `--timeout N` / `--timeout=N` there too.
     while cmd and cmd[0].startswith("--timeout"):
         opt = cmd.pop(0)
@@ -1045,6 +1052,16 @@ def cmd_run(args) -> int:
     if not ITEM_ID_RE.match(name) or not cmd:
         print("usage: core run NAME [--timeout S] -- COMMAND...", file=sys.stderr)
         return 2
+    try:
+        return run_supervised(name, cmd, timeout)
+    except OSError as e:
+        print("WARNING: core run could not record {} ({}); running it unsupervised".format(name, e),
+              file=sys.stderr)
+        status, code, last = run_command(cmd, timeout)
+        return code
+
+
+def run_supervised(name: str, cmd, timeout: int) -> int:
     with file_lock(lease_path(name), blocking=False) as got:
         if not got:
             print("skipped: {} is already running".format(name))
@@ -1122,8 +1139,15 @@ def heartbeat_alarms():
             alarms.append("{} has never run (expected every {}{})".format(name, every, hint))
             continue
         status, last = rec.get("status"), one_line(str(rec.get("last_line") or ""), 200)
+        finished_at = parse_time(rec.get("finished"))
+        if any(t and (t - now_dt).total_seconds() > 300 for t in (started, finished_at)):
+            alarms.append("{} has a run record dated in the future — the clock or the record is wrong".format(name))
+            continue
+        if status not in ("ok", "failed", "timeout", "killed", "running"):
+            alarms.append("{} has an unrecognized status: {}".format(name, one_line(str(status), 40)))
+            continue
         if status == "running":
-            if not lease_held(name):
+            if not wrapper_alive(rec):
                 alarms.append("{} started {} and never finished".format(name, human_gap(now_dt - started)))
             elif (now_dt - started).total_seconds() > seconds * HEARTBEAT_GRACE:
                 alarms.append("{} has been running for {} (expected every {}) — may be hung".format(
