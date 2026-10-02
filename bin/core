@@ -972,6 +972,316 @@ def recall_hits(text: str, files):
     return lexical if hybrid is None else hybrid
 
 
+# ---- the quiet sweep: read conversations, capture what would otherwise be lost ----
+INJECTED_RE = re.compile(r"^\s*<(local-command-|command-|system-reminder|bash-|user-prompt-submit-hook|task-notification)")
+
+
+def _message_text(content):
+    """Text a person or assistant actually wrote: strings and text blocks only."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text" and b.get("text"))
+    return ""
+
+
+def transcript_turns(path: Path):
+    """[(line_no, 'user'|'assistant', text)] from a Claude Code transcript: the person's own messages
+    and the assistant's visible replies. Tool calls/results, hidden reasoning, hook and system
+    injections, and subagent traffic are dropped; consecutive assistant texts merge into one reply."""
+    turns = []
+    try:
+        fh = open(str(path), errors="replace")
+    except OSError:
+        return turns
+    with fh:
+        for n, raw in enumerate(fh, 1):
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or d.get("type") not in ("user", "assistant"):
+                continue
+            if d.get("isMeta") or d.get("isSidechain"):
+                continue
+            msg = d.get("message")
+            if not isinstance(msg, dict):
+                continue
+            text = _message_text(msg.get("content")).strip()
+            if not text:
+                continue
+            role = d["type"]
+            if role == "user" and (INJECTED_RE.match(text) or NOT_FROM_PERSON_RE.search(text[:400])):
+                continue
+            if role == "assistant" and turns and turns[-1][1] == "assistant":
+                turns[-1] = (turns[-1][0], "assistant", turns[-1][2] + "\n" + text)
+                continue
+            turns.append((n, role, text))
+    return turns
+
+
+SWEEP_TYPES = ("decision", "correction", "fact", "preference", "loop")
+# A maybe is never a decision: these mark a quote as a question, hypothetical or brainstorm.
+TENTATIVE_RE = re.compile(r"\b(maybe|perhaps|might|what if|not sure|i wonder|could we|should we|"
+                          r"would it|we could|possibly|thinking about)\b", re.I)  # a "?" alone is often a directive
+QUOTE_MATCH = 0.8  # share of the quote's words that must appear, in order, in what the person typed
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def sweep_gate(items, turns):
+    """Keep only extractions a person could verify: a known type, a statement, and a quote that
+    appears verbatim (up to spacing/case) in one of the PERSON's turns — never the assistant's —
+    and isn't tentative. The cited line is where the quote really is, not where the model says."""
+    user_turns = [(n, _squash(t)) for n, r, t in turns if r == "user"]
+    kept, seen = [], set()
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        typ, stmt, quote = it.get("type"), it.get("statement"), it.get("quote")
+        if typ not in SWEEP_TYPES or not isinstance(stmt, str) or not stmt.strip() or not isinstance(quote, str):
+            continue
+        q = _squash(quote)
+        if len(q) < 2 or TENTATIVE_RE.search(quote):
+            continue
+        found = find_quote(quote, turns)
+        if not found:
+            continue
+        line, said = found
+        if _squash(said) in seen or TENTATIVE_RE.search(said):
+            continue
+        seen.add(_squash(said))
+        kept.append({"type": typ, "statement": " ".join(stmt.split()), "quote": said, "line": line})
+    return kept
+
+
+def find_quote(quote, turns):
+    """(line, the person's exact words) for a quote the model may have tidied (typos fixed, a word
+    dropped), or None. Short quotes must match exactly; longer ones need QUOTE_MATCH of their words
+    in order within a tight span. The returned evidence is always the person's own text."""
+    import difflib
+    qw = [w.lower() for w in re.findall(r"\w+", quote)]
+    if not qw:
+        return None
+    for n, role, text in turns:
+        if role != "user":
+            continue
+        if _squash(quote) in _squash(text):
+            i = _squash(text).find(_squash(quote))
+            return n, " ".join(text.split())[i:i + len(_squash(quote))]
+    if len(qw) <= 3:
+        return None
+    best = None
+    for n, role, text in turns:
+        if role != "user":
+            continue
+        toks = list(re.finditer(r"\w+", text))
+        tw = [m.group().lower() for m in toks]
+        blocks = [b for b in difflib.SequenceMatcher(None, qw, tw, autojunk=False).get_matching_blocks() if b.size]
+        matched = sum(b.size for b in blocks)
+        if not blocks or matched < QUOTE_MATCH * len(qw):
+            continue
+        first, last = blocks[0].b, blocks[-1].b + blocks[-1].size - 1
+        if last - first + 1 > 1.3 * len(qw) + 2:
+            continue  # scattered words, not one passage
+        score = matched / len(qw)
+        if not best or score > best[0]:
+            best = (score, n, text[toks[first].start():toks[last].end()])
+    return (best[1], best[2]) if best else None
+
+
+SWEEP_PROMPT = """You read part of a conversation between a person and their coding assistant and pick out
+what the assistant should remember long-term to serve this person better in future sessions.
+Most conversation is NOT worth remembering; an empty list is often right.
+
+Capture only:
+- decision: the person settles a choice that will matter later, or explicitly accepts a concrete proposal.
+- correction: the person says the assistant got something wrong, or how it should behave differently.
+- fact: a durable fact about the person, their work, people, projects, tools or accounts.
+- preference: how the person likes things done.
+- loop: something promised or left to come back to, unresolved here.
+
+Never capture: in-the-moment task chatter, anything only the assistant said, questions, maybes,
+brainstorming or "we could" ideas.
+
+For each item give: type; statement (one self-contained sentence, third person: "The person ...");
+quote (copied EXACTLY from one of the PERSON's lines, under 200 characters); line (that line's number).
+
+Conversation:
+{conversation}"""
+
+SWEEP_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
+    "type": "object", "properties": {"type": {"type": "string", "enum": list(SWEEP_TYPES)},
+                                     "statement": {"type": "string"}, "quote": {"type": "string"},
+                                     "line": {"type": "integer"}},
+    "required": ["type", "statement", "quote", "line"]}}}, "required": ["items"]}
+
+
+def sweep_config():
+    vals = {k: (recall_conf_values(k) or [None])[-1] for k in ("sweep_model", "sweep_url", "embed_url", "sweep_api")}
+    url = (vals["sweep_url"] or vals["embed_url"] or "http://localhost:11434").rstrip("/")
+    return vals["sweep_model"], url, (vals["sweep_api"] or "ollama")
+
+
+def render_conversation(turns, reply_chars=1200):
+    out = []
+    for n, role, text in turns:
+        who = "PERSON" if role == "user" else "ASSISTANT"
+        out.append("[line {}] {}: {}".format(n, who, text if role == "user" else text[:reply_chars]))
+    return "\n\n".join(out)
+
+
+def parse_json_reply(content: str):
+    """The JSON object in a model reply, tolerating <think> blocks and ``` fences."""
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.S)
+    start, end = content.find("{"), content.rfind("}")
+    return json.loads(content[start:end + 1]) if start >= 0 < end else {}
+
+
+def sweep_extract(turns, model, url, timeout=600, think=False, api="ollama"):
+    """Ask a local model for candidate items (raw: always gate them). api 'ollama' = /api/chat with a
+    JSON schema; api 'openai' = any OpenAI-compatible server (mlx_lm, LM Studio, llama.cpp)."""
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # memory never via a proxy
+    messages = [{"role": "user", "content": SWEEP_PROMPT.format(conversation=render_conversation(turns))
+                 + "\n\nReply with only a JSON object: {\"items\": [...]}"}]
+    if api == "claude":  # Claude Code headless on the person's own subscription: no hooks, no transcript, no tools
+        cmd = ["claude", "-p", "--model", model, "--no-session-persistence", "--output-format", "json",
+               "--settings", json.dumps({"disableAllHooks": True}), "--tools", ""]
+        r = subprocess.run(cmd, input=messages[0]["content"], capture_output=True, text=True, timeout=timeout,
+                           cwd=str(home_dir()))
+        if r.returncode != 0:
+            raise RuntimeError("claude -p failed: " + one_line(r.stderr or r.stdout, 200))
+        data = parse_json_reply(json.loads(r.stdout).get("result", ""))
+        return data.get("items", []) if isinstance(data, dict) else []
+    if api == "openai":
+        endpoint = url + "/v1/chat/completions"
+        body = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 4096,
+                "chat_template_kwargs": {"enable_thinking": think}}
+    else:
+        endpoint = url + "/api/chat"
+        body = {"model": model, "stream": False, "format": SWEEP_SCHEMA, "think": think,
+                "options": {"temperature": 0, "num_ctx": 16384}, "keep_alive": "2m", "messages": messages}
+    req = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    with opener.open(req, timeout=timeout) as resp:
+        reply = json.load(resp)
+    content = reply["choices"][0]["message"]["content"] if api == "openai" else reply["message"]["content"]
+    data = parse_json_reply(content)
+    return data.get("items", []) if isinstance(data, dict) else []
+
+
+SWEEP_QUIET = 1800          # a conversation is swept once it has been idle this long
+SWEEP_FIRST_LOOKBACK = 86400  # first run: only conversations active in the last day (no backlog flood)
+SWEEP_MAX_FILES = 5         # bounded work per run
+SWEEP_CHUNK_CHARS = 9000
+
+
+def sweep_state_path() -> Path:
+    return home_dir() / "sweep-state.json"
+
+
+def sweep_sources():
+    dirs = [Path(os.path.expanduser(d)) for d in recall_conf_values("sweep_dir")] or \
+        [Path.home() / ".claude" / "projects"]
+    out = []
+    for d in dirs:
+        out.extend(p for p in d.glob("*/*.jsonl") if p.is_file())
+        out.extend(p for p in d.glob("*.jsonl") if p.is_file())
+    return out
+
+
+def chunk_turns(turns, limit=SWEEP_CHUNK_CHARS):
+    chunk, size = [], 0
+    for t in turns:
+        n = len(t[2]) if t[1] == "user" else min(len(t[2]), 1200)
+        if chunk and size + n > limit:
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(t)
+        size += n
+    if chunk:
+        yield chunk
+
+
+def sweep_offer_text(item, path):
+    text = 'Sweep offer — save to memory? [{}] {} Evidence: they said "{}" ({}:{}).'.format(
+        item["type"], item["statement"], one_line(item["quote"], 200), display_path(path), item["line"])
+    try:
+        related = recall_search(item["statement"], recall_sources(), limit=2)
+    except Exception:
+        related = []
+    if related:
+        text += " Possibly superseded by this: " + "; ".join(
+            "{}:{}".format(display_path(f), n) for f, n, _ in related) + "."
+    return text + " Ask the person; save only on an explicit yes, and mark any note it replaces."
+
+
+def cmd_sweep(args) -> int:
+    """Read conversations that have gone quiet, extract what's worth remembering, and OFFER it via the
+    inbox. Never writes memory itself. Exit 1 when any conversation couldn't be swept (so the
+    heartbeat alarms); its watermark stays put and it is retried next run."""
+    model, url, api = sweep_config()
+    if not model:
+        print("core sweep: set `sweep_model <ollama model>` in ~/.core/recall.conf first "
+              "(e.g. sweep_model qwen3:8b)", file=sys.stderr)
+        return 2
+    with file_lock(home_dir() / "sweep.lock", blocking=False) as got:
+        if not got:
+            print("sweep already running")
+            return 0
+        try:
+            state = json.loads(sweep_state_path().read_text())
+        except (OSError, ValueError):
+            state = None
+        first_run = state is None
+        state = state if isinstance(state, dict) else {}
+        now_ts = time.time()
+        due, failed, offered = [], 0, 0
+        for p in sweep_sources():
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if now_ts - mtime < SWEEP_QUIET:
+                continue  # still active: wait until it goes quiet
+            if first_run and now_ts - mtime > SWEEP_FIRST_LOOKBACK:
+                state[str(p)] = 10 ** 9  # history before install isn't swept
+                continue
+            due.append((mtime, p))
+        for _, p in sorted(due, reverse=True)[:SWEEP_MAX_FILES]:
+            mark = state.get(str(p), 0)
+            turns = [t for t in transcript_turns(p) if t[0] > mark]
+            if not any(r == "user" for _, r, _ in turns):
+                continue
+            try:
+                items = []
+                for chunk in chunk_turns(turns):
+                    items.extend(sweep_gate(sweep_extract(chunk, model, url, api=api), chunk))
+            except Exception as e:
+                print("couldn't sweep {}: {}".format(display_path(p), one_line(str(e), 200)), file=sys.stderr)
+                failed += 1
+                continue
+            log = home_dir() / "sweep.log"
+            with open(str(log), "a") as fh:
+                for it in items:
+                    fh.write(json.dumps(dict(it, path=str(p), at=now().isoformat(timespec="seconds"))) + "\n")
+            for it in items:
+                key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()).hexdigest()[:12]
+                deliver_item(sweep_offer_text(it, p), "sweep", key, skip_if_acked=True)
+                offered += 1
+            state[str(p)] = turns[-1][0]
+            tmp = sweep_state_path().with_suffix(".tmp")
+            tmp.write_text(json.dumps(state))
+            os.replace(str(tmp), str(sweep_state_path()))
+        if first_run and not sweep_state_path().exists():
+            sweep_state_path().write_text(json.dumps(state))
+        print("sweep: {} offer(s){}".format(offered, ", {} conversation(s) failed".format(failed) if failed else ""))
+        return 1 if failed else 0
+
+
 def cmd_recall(args) -> int:
     """Never breaks the session: memory and inbox fail independently; always exit 0."""
     if getattr(args, "reindex", False):
@@ -1669,6 +1979,9 @@ def main(argv=None) -> int:
     p_brief = sub.add_parser("brief", help="what needs you right now (read-only audits)")
     p_brief.add_argument("--deliver", action="store_true", help="also put each audit's findings in the inbox")
     p_brief.set_defaults(func=cmd_brief)
+
+    p_sweep = sub.add_parser("sweep", help="offer what's worth remembering from quiet conversations")
+    p_sweep.set_defaults(func=cmd_sweep)
 
     p_recall = sub.add_parser("recall", help="(UserPromptSubmit hook) cited memory hits for this message")
     p_recall.add_argument("--query", help="search text instead of hook JSON on stdin")
