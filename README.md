@@ -79,6 +79,7 @@ it with `core loop add "<promise>"`.
 | `core brief [--deliver]` | run the read-only audits in `audits/` — repos with no remote, unpushed work, scheduled jobs for work that has ended; `--deliver` puts each audit's findings in the inbox (one item per audit, updated on re-run) |
 | `core deliver ... --replace` | same key while pending → update that item's text to this one (without it the pending text is kept, and it tells you) |
 | `core run NAME [--timeout S] -- CMD...` | run a background job under a lease (no overlap; if the wrapper is killed it kills the job's process group, and a still-alive orphan from a hard kill blocks the next run and keeps alarming), with a timeout that kills its whole process group, recording start/finish/status/last line in `~/.core/heartbeat.json` |
+| `core sweep` | offer what's worth remembering from quiet conversations (see below) |
 | `core heartbeat` | alarms for every pass in `~/.core/passes.conf` (`expect NAME every 1d`) that never ran, failed, timed out, was killed, has been running too long, died mid-run, or is overdue (1.5x its interval); unparseable `passes.conf` lines are alarms too; exit 1 when any |
 
 **Audits** are plain bash scripts listed in `audits/MANIFEST`, one finding per output line. Configure in
@@ -148,6 +149,31 @@ miss, such as "Rust extensions" → your editor preferences, and adds a few loos
 since the last index, and memories under ~30 chunks, are matched by words. `tools/eval_recall.py`
 scores recall against your own labeled messages — a JSON list of
 `{"prompt": "...", "expect": "recall" | "silent", "relevant": ["note_name", ...], "split": "dev"}`.
+
+**Optional: the quiet sweep** (`core sweep`) reads Claude Code conversations once they've been idle 30
+minutes and *offers* what's worth remembering — decisions, corrections, durable facts, preferences, open
+loops — through the inbox. It never writes memory itself: every offer quotes the person's own words
+(checked by code, not the model) and the agent saves it only on an explicit yes; a correction that
+contradicts an existing note is offered as "update X → Y". Configure in `~/.core/recall.conf`:
+
+```
+sweep_model qwen3:8b            # any Ollama model; or a model name with sweep_api below
+# sweep_api ollama | openai | claude   (openai = LM Studio / llama.cpp / mlx_lm server; claude = `claude -p`)
+# sweep_url http://localhost:11434
+# sweep_strict on               # block anything question-shaped (default; turn off for strong models)
+# sweep_offer_types fact preference correction   # the rest is logged only
+# sweep_offers_per_day 5        # a few a day at most; corrections first
+# sweep_shadow on               # log what it would offer to ~/.core/sweep.log, offer nothing
+```
+
+Run it on a schedule under `core run sweep -- core sweep` with `expect sweep every 3h` in
+`passes.conf`. Each run is bounded (20 extractor calls, 20 minutes) and saves progress per chunk;
+before an offer, the model checks your most related memory lines so you're never offered what you
+already have. With `sweep_api claude` the extractor runs isolated: no tools, no MCP servers, no hooks,
+no saved transcript. **Where conversations go is `sweep_url`'s / the extractor's business**: a local
+model keeps them on this machine. Measured on real conversations with blind judges, extraction
+quality depends heavily on the model; test yours with `tools/eval_recall.py`-style labels before
+turning offers on (start in shadow).
 
 **Heartbeats come first.** A schedule is not proof a job ran. `core inject` puts `HEARTBEAT ALARM:` lines
 right under its header, and `core brief` opens with `NOT RUNNING THAT SHOULD BE`.

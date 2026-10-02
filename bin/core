@@ -973,7 +973,8 @@ def recall_hits(text: str, files):
 
 
 # ---- the quiet sweep: read conversations, capture what would otherwise be lost ----
-INJECTED_RE = re.compile(r"^\s*<(local-command-|command-|system-reminder|bash-|user-prompt-submit-hook|task-notification)")
+INJECTED_RE = re.compile(r"^\s*(<(local-command-|command-|system-reminder|bash-|user-prompt-submit-hook|task-notification)"
+                         r"|\[Request interrupted)")
 
 
 def _message_text(content):
@@ -1003,8 +1004,8 @@ def transcript_turns(path: Path):
                 continue
             if not isinstance(d, dict) or d.get("type") not in ("user", "assistant"):
                 continue
-            if d.get("isMeta") or d.get("isSidechain"):
-                continue
+            if d.get("isMeta") or d.get("isSidechain") or d.get("isCompactSummary") or d.get("isVisibleInTranscriptOnly"):
+                continue  # not the person: tooling, subagents, and Claude Code's own summaries
             msg = d.get("message")
             if not isinstance(msg, dict):
                 continue
@@ -1057,8 +1058,12 @@ def sweep_gate(items, turns, traps=None, strict=True):
         typ, stmt, quote = it.get("type"), it.get("statement"), it.get("quote")
         if typ not in SWEEP_TYPES or not isinstance(stmt, str) or not stmt.strip() or not isinstance(quote, str):
             continue
+        if not statement_ok(stmt):
+            continue
         q = _squash(quote)
         has_proposal = isinstance(it.get("proposal"), str) and it["proposal"].strip()
+        if len(re.findall(r"\w+", quote)) <= 3 and not has_proposal:
+            continue  # "ok do it" proves a yes, not what was agreed to
         if not q or (len(q) < 2 and not has_proposal) or is_tentative(quote, questions=strict):
             continue
         found = find_quote(quote, turns, line_hint=it.get("line"))
@@ -1079,6 +1084,17 @@ def sweep_gate(items, turns, traps=None, strict=True):
         seen.add(_squash(said))
         kept.append(entry)
     return kept
+
+
+STATEMENT_MAX = 200
+# Statements become text an agent reads at session start: anything shaped like an instruction, code,
+# or a link is refused, whatever the extractor was talked into writing.
+INSTRUCTION_RE = re.compile(r"https?://|www\.|`|\b(curl|wget|sudo|rm -|chmod|ssh|eval|exec(ute)?|run (this|the|`)|"
+                            r"ignore (all|previous|prior)|instructions?|important:|system prompt|before replying)\b", re.I)
+
+
+def statement_ok(stmt: str) -> bool:
+    return 0 < len(stmt.strip()) <= STATEMENT_MAX and "\n" not in stmt.strip() and not INSTRUCTION_RE.search(stmt)
 
 
 def _is_trap(said, line, traps):
@@ -1211,37 +1227,67 @@ def parse_json_reply(content: str):
     return json.loads(content[start:end + 1]) if start >= 0 < end else {}
 
 
+def model_json(prompt, model, url, api="ollama", schema=None, timeout=600, think=False):
+    """One prompt → the JSON object in the reply. Raises on transport errors, refusals, cut-offs."""
+    return _call_model(prompt, model, url, api=api, schema=schema, timeout=timeout, think=think)
+
+
 def sweep_extract(turns, model, url, timeout=600, think=False, api="ollama"):
     """Ask a local model for candidate items (raw: always gate them). api 'ollama' = /api/chat with a
     JSON schema; api 'openai' = any OpenAI-compatible server (mlx_lm, LM Studio, llama.cpp)."""
+    prompt = (SWEEP_PROMPT.format(conversation=render_conversation(turns))
+              + "\n\nReply with only a JSON object: {\"items\": [...], \"traps\": [...]}")
+    return _items_and_traps(_call_model(prompt, model, url, api=api, schema=SWEEP_SCHEMA, timeout=timeout, think=think))
+
+
+def _call_model(prompt, model, url, api="ollama", schema=None, timeout=600, think=False):
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # memory never via a proxy
-    messages = [{"role": "user", "content": SWEEP_PROMPT.format(conversation=render_conversation(turns))
-                 + "\n\nReply with only a JSON object: {\"items\": [...], \"traps\": [...]}"}]
+    messages = [{"role": "user", "content": prompt}]
     if api == "claude":  # Claude Code headless on the person's own subscription: no hooks, no transcript, no tools
+        # Isolated: no tools, no MCP servers (e.g. mail), no skills, no hooks, no saved transcript.
         cmd = ["claude", "-p", "--model", model, "--no-session-persistence", "--output-format", "json",
-               "--settings", json.dumps({"disableAllHooks": True}), "--tools", ""]
+               "--settings", json.dumps({"disableAllHooks": True}), "--tools", "", "--strict-mcp-config",
+               "--mcp-config", json.dumps({"mcpServers": {}}), "--permission-mode", "default",
+               "--disable-slash-commands"]
+        env = {k: v for k, v in os.environ.items()
+               if not (k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_"))}  # not a child of a live session
         r = subprocess.run(cmd, input=messages[0]["content"], capture_output=True, text=True, timeout=timeout,
-                           cwd=str(home_dir()))
+                           cwd=str(home_dir()), env=env)
         if r.returncode != 0:
             raise RuntimeError("claude -p failed: " + one_line(r.stderr or r.stdout, 200))
-        return _items_and_traps(parse_json_reply(json.loads(r.stdout).get("result", "")))
+        out = json.loads(r.stdout)
+        if out.get("is_error"):
+            raise RuntimeError("claude -p: " + one_line(str(out.get("result")), 200))
+        return _require_json(parse_json_reply(out.get("result", "")))
     if api == "openai":
         endpoint = url + "/v1/chat/completions"
         body = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 4096,
                 "chat_template_kwargs": {"enable_thinking": think}}
     else:
         endpoint = url + "/api/chat"
-        body = {"model": model, "stream": False, "format": SWEEP_SCHEMA, "think": think,
+        body = {"model": model, "stream": False, "format": schema or "json", "think": think,
                 "options": {"temperature": 0, "num_ctx": 16384}, "keep_alive": "2m", "messages": messages}
     req = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     with opener.open(req, timeout=timeout) as resp:
         reply = json.load(resp)
     content = reply["choices"][0]["message"]["content"] if api == "openai" else reply["message"]["content"]
-    return _items_and_traps(parse_json_reply(content))
+    return _require_json(parse_json_reply(content))
+
+
+def _require_json(data):
+    if not isinstance(data, dict) or not data:
+        raise ValueError("model reply had no JSON result")  # a refusal or cut-off is a failure, never "nothing"
+    return data
 
 
 def _items_and_traps(data):
+    if "items" not in data:
+        raise ValueError("extractor reply had no items")
+    return _split_items(data)
+
+
+def _split_items(data):
     if not isinstance(data, dict):
         return [], []
     items, traps = data.get("items", []), data.get("traps", [])
@@ -1249,9 +1295,13 @@ def _items_and_traps(data):
 
 
 SWEEP_QUIET = 1800          # a conversation is swept once it has been idle this long
-SWEEP_FIRST_LOOKBACK = 86400  # first run: only conversations active in the last day (no backlog flood)
-SWEEP_MAX_FILES = 5         # bounded work per run
+SWEEP_MAX_CHUNKS = 20       # extractor calls per run; the rest waits for the next run
+SWEEP_DEADLINE = 1200       # seconds; a run stops starting new chunks after this
 SWEEP_CHUNK_CHARS = 9000
+SWEEP_MAX_TRIES = 3         # a chunk that fails this many runs in a row is skipped (and logged)
+SWEEP_OFFERS_PER_DAY = 5    # Muse: "a few times a day at most"; the rest stays in the log
+SWEEP_LOG_MAX = 5 * 1024 * 1024
+OFFER_PRIORITY = {"correction": 0, "preference": 1, "decision": 2, "fact": 3, "loop": 4}
 
 
 def sweep_state_path() -> Path:
@@ -1281,99 +1331,204 @@ def chunk_turns(turns, limit=SWEEP_CHUNK_CHARS):
         yield chunk
 
 
-def sweep_offer_text(item, path):
-    evidence = 'they said "{}" ({}:{})'.format(one_line(item["quote"], 200), display_path(path), item["line"])
-    if item.get("proposal"):
-        evidence += ', answering "{}"'.format(one_line(item["proposal"], 160))
+def sweep_offer_text(item, path, target=None):
+    """Fits the inbox line (INBOX_TEXT_CHARS) and leads with the rule, so truncation never drops it.
+    With a target memory line, it is framed as an update (old → new), never a parallel note."""
+    head = "Sweep offer (ask before saving; only on an explicit yes): "
+    where = " — {}:{}".format(display_path(path), item["line"])
+    if target:
+        f, n, was = target
+        body = 'Update memory? {}:{} "{}" → "{}"; they said "{}"'.format(
+            display_path(f), n, one_line(was, 70), item["statement"], item["quote"])
+    else:
+        body = '[{}] "{}"; they said "{}"'.format(item["type"], item["statement"], item["quote"])
+    return one_line(head + body, INBOX_TEXT_CHARS - len(where)) + where
+
+
+JUDGE_PROMPT = """A memory assistant wants to save one new item. Here are the most related lines already in memory:
+{lines}
+
+New item: {statement}
+
+Answer with one of: "known" (memory already says this), "new" (not in memory), or "updates" (it changes or
+contradicts one of the lines; give that line's number in "replaces").
+Reply with only a JSON object: {{"verdict": "known" | "new" | "updates", "replaces": <number or 0>}}"""
+
+
+def related_memory(statement, k=3):
     try:
-        related = recall_search(item["statement"], recall_sources(), limit=2)
+        return recall_search(statement, recall_sources(), limit=k, min_score=0)
     except Exception:
-        related = []
-    if item["type"] == "correction" and related:
-        f, n, old = related[0]
-        return ('Sweep offer — Update memory? {}:{} says "{}" → {} Evidence: {}. Ask the person; on an '
-                'explicit yes, replace the old line (note what it replaced), never keep both.').format(
-            display_path(f), n, one_line(old, 160), item["statement"], evidence)
-    text = "Sweep offer — save to memory? [{}] {} Evidence: {}.".format(item["type"], item["statement"], evidence)
-    if related:
-        text += " Possibly superseded by this: " + "; ".join(
-            "{}:{}".format(display_path(f), n) for f, n, _ in related) + "."
-    return text + " Ask the person; save only on an explicit yes, and mark any note it replaces."
+        return []
+
+
+def judge_novelty(item, related, model, url, api):
+    """('known'|'new'|'updates', target_hit_or_None). Any failure → ('new', None): offer it plainly."""
+    if not related:
+        return "new", None
+    lines = "\n".join("{}. {}".format(i, one_line(t, 240)) for i, (_, _, t) in enumerate(related, 1))
+    try:
+        v = model_json(JUDGE_PROMPT.format(lines=lines, statement=item["statement"]), model, url, api=api, timeout=180)
+    except Exception:
+        return "new", None
+    verdict = v.get("verdict")
+    if verdict == "known":
+        return "known", None
+    if verdict == "updates":
+        try:
+            return "updates", related[int(v.get("replaces")) - 1]
+        except (TypeError, ValueError, IndexError):
+            return "new", None
+    return "new", None
+
+
+def _load_sweep_state():
+    try:
+        st = json.loads(sweep_state_path().read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict):
+        return None
+    files = st.get("files") if "files" in st else {k: {"line": v} for k, v in st.items() if isinstance(v, int)}
+    return {"files": files if isinstance(files, dict) else {}, "offers": st.get("offers", {})}
+
+
+def _save_sweep_state(state):
+    tmp = sweep_state_path().with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(str(tmp), str(sweep_state_path()))
+
+
+def _sweep_log(entry):
+    log = home_dir() / "sweep.log"
+    try:
+        if log.stat().st_size > SWEEP_LOG_MAX:
+            os.replace(str(log), str(log) + ".1")
+    except OSError:
+        pass
+    fd = os.open(str(log), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)  # raw conversation text: private
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def _last_line(path: Path) -> int:
+    turns = transcript_turns(path)
+    return turns[-1][0] if turns else 0
 
 
 def cmd_sweep(args) -> int:
     """Read conversations that have gone quiet, extract what's worth remembering, and OFFER it via the
-    inbox. Never writes memory itself. Exit 1 when any conversation couldn't be swept (so the
-    heartbeat alarms); its watermark stays put and it is retried next run."""
+    inbox. Never writes memory itself. Bounded per run (chunks, deadline); progress is saved per chunk.
+    Exit 1 when a chunk failed (the heartbeat alarms); it is retried, and skipped after SWEEP_MAX_TRIES."""
     model, url, api = sweep_config()
     if not model:
-        print("core sweep: set `sweep_model <ollama model>` in ~/.core/recall.conf first "
+        print("core sweep: set `sweep_model <model>` in ~/.core/recall.conf first "
               "(e.g. sweep_model qwen3:8b)", file=sys.stderr)
         return 2
+    conf = lambda k, d: (recall_conf_values(k) or [d])[-1]
+    flag = lambda k, d: conf(k, d).lower() in ("on", "yes", "true", "1")
+    shadow = flag("sweep_shadow", "off")
+    # strict: also block anything shaped like a question (for weaker local models). Off: trust the
+    # extractor's own trap list (strong models judge "he needs two eyes?" better than a regex).
+    strict = flag("sweep_strict", "on")
+    try:
+        max_chunks = max(1, int(conf("sweep_max_chunks", SWEEP_MAX_CHUNKS)))
+        per_day = max(0, int(conf("sweep_offers_per_day", SWEEP_OFFERS_PER_DAY)))
+    except ValueError:
+        max_chunks, per_day = SWEEP_MAX_CHUNKS, SWEEP_OFFERS_PER_DAY
+    offer_types = set(" ".join(recall_conf_values("sweep_offer_types")).split()) or set(SWEEP_TYPES)
     with file_lock(home_dir() / "sweep.lock", blocking=False) as got:
         if not got:
             print("sweep already running")
             return 0
-        try:
-            state = json.loads(sweep_state_path().read_text())
-        except (OSError, ValueError):
-            state = None
+        state = _load_sweep_state()
         first_run = state is None
-        state = state if isinstance(state, dict) else {}
-        now_ts = time.time()
-        due, failed, offered, shadow_items = [], 0, 0, 0
-        shadow = (recall_conf_values("sweep_shadow") or ["off"])[-1].lower() in ("on", "yes", "true", "1")
-        # strict: also block anything shaped like a question/maybe (for weaker local models). Off: trust
-        # the extractor's own trap list (strong models judge "he needs two eyes?" better than a regex).
-        strict = (recall_conf_values("sweep_strict") or ["on"])[-1].lower() not in ("off", "no", "false", "0")
+        state = state or {"files": {}, "offers": {}}
+        files = state["files"]
+        start, now_ts = time.monotonic(), time.time()
+        due = []
         for p in sweep_sources():
             try:
-                mtime = p.stat().st_mtime
+                st = p.stat()
             except OSError:
                 continue
-            if now_ts - mtime < SWEEP_QUIET:
-                continue  # still active: wait until it goes quiet
-            if first_run and now_ts - mtime > SWEEP_FIRST_LOOKBACK:
-                state[str(p)] = 10 ** 9  # history before install isn't swept
+            rec = files.get(str(p), {})
+            if first_run and now_ts - st.st_mtime > 86400:
+                files[str(p)] = {"line": _last_line(p), "size": st.st_size}  # history before install: skip
                 continue
-            due.append((mtime, p))
-        for _, p in sorted(due, reverse=True)[:SWEEP_MAX_FILES]:
-            mark = state.get(str(p), 0)
-            turns = [t for t in transcript_turns(p) if t[0] > mark]
+            if now_ts - st.st_mtime < SWEEP_QUIET or rec.get("size") == st.st_size:
+                continue  # still active, or nothing new since last time
+            due.append((st.st_mtime, p, st.st_size))
+        due.sort()  # oldest first: nobody starves behind newer conversations
+        calls, failed, kept_total, candidates = 0, 0, 0, []
+        for _, p, size in due:
+            rec = files.setdefault(str(p), {})
+            turns = [t for t in transcript_turns(p) if t[0] > rec.get("line", 0)]
             if not any(r == "user" for _, r, _ in turns):
+                rec["size"] = size
                 continue
-            try:
-                items, raws = [], []
-                for chunk in chunk_turns(turns):
+            finished = True
+            for chunk in chunk_turns(turns):
+                if calls >= max_chunks or time.monotonic() - start > SWEEP_DEADLINE:
+                    finished = False
+                    break
+                calls += 1
+                key = str(chunk[0][0])
+                try:
                     raw, traps = sweep_extract(chunk, model, url, api=api)
-                    raws.append({"from_line": chunk[0][0], "to_line": chunk[-1][0], "raw": raw, "traps": traps})
-                    items.extend(sweep_gate(raw, chunk, traps=traps, strict=strict))
-            except Exception as e:
-                print("couldn't sweep {}: {}".format(display_path(p), one_line(str(e), 200)), file=sys.stderr)
-                failed += 1
-                continue
-            log = home_dir() / "sweep.log"
-            with open(str(log), "a") as fh:
-                fh.write(json.dumps({"at": now().isoformat(timespec="seconds"), "path": str(p), "model": model,
-                                     "shadow": shadow, "items": items, "raw": raws}) + "\n")
-            offer_types = set(" ".join(recall_conf_values("sweep_offer_types")).split()) or set(SWEEP_TYPES)
-            for it in [] if shadow else [i for i in items if i["type"] in offer_types]:
-                key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()).hexdigest()[:12]
-                deliver_item(sweep_offer_text(it, p), "sweep", key, skip_if_acked=True)
-                offered += 1
-            shadow_items += len(items)
-            state[str(p)] = turns[-1][0]
-            tmp = sweep_state_path().with_suffix(".tmp")
-            tmp.write_text(json.dumps(state))
-            os.replace(str(tmp), str(sweep_state_path()))
+                except Exception as e:
+                    tries = rec.setdefault("fails", {}).get(key, 0) + 1
+                    rec["fails"][key] = tries
+                    if tries < SWEEP_MAX_TRIES:
+                        print("couldn't sweep {} (lines {}-{}): {}".format(display_path(p), chunk[0][0], chunk[-1][0],
+                                                                          one_line(str(e), 200)), file=sys.stderr)
+                        failed += 1
+                        finished = False
+                        break
+                    print("gave up on {} lines {}-{} after {} tries: {}".format(
+                        display_path(p), chunk[0][0], chunk[-1][0], tries, one_line(str(e), 160)), file=sys.stderr)
+                    failed += 1  # loud once: that part of the conversation won't be swept
+                    _sweep_log({"at": now().isoformat(timespec="seconds"), "path": str(p), "skipped": True,
+                                "from_line": chunk[0][0], "to_line": chunk[-1][0], "error": one_line(str(e), 200)})
+                    raw, traps = [], []
+                items = sweep_gate(raw, chunk, traps=traps, strict=strict)
+                _sweep_log({"at": now().isoformat(timespec="seconds"), "path": str(p), "model": model,
+                            "shadow": shadow, "from_line": chunk[0][0], "to_line": chunk[-1][0],
+                            "items": items, "raw": raw, "traps": traps})
+                kept_total += len(items)
+                candidates.extend((it, p) for it in items if it["type"] in offer_types)
+                rec["line"] = chunk[-1][0]
+                rec.get("fails", {}).pop(key, None)
+                _save_sweep_state(state)
+            if finished:
+                rec["size"] = size
+            _save_sweep_state(state)
         if first_run and not sweep_state_path().exists():
-            sweep_state_path().write_text(json.dumps(state))
+            _save_sweep_state(state)
+        offered = 0
+        if not shadow:
+            today = now().strftime("%Y-%m-%d")
+            if state["offers"].get("date") != today:
+                state["offers"] = {"date": today, "n": 0}
+            for it, p in sorted(candidates, key=lambda c: OFFER_PRIORITY.get(c[0]["type"], 9)):
+                if state["offers"]["n"] >= per_day:
+                    break
+                verdict, target = judge_novelty(it, related_memory(it["statement"]), model, url, api)
+                _sweep_log({"at": now().isoformat(timespec="seconds"), "judged": it["statement"], "verdict": verdict,
+                            "target": "{}:{}".format(target[0], target[1]) if target else None})
+                if verdict == "known":
+                    continue  # memory already says this: nothing new to offer
+                key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()).hexdigest()[:12]
+                deliver_item(sweep_offer_text(it, p, target), "sweep", key, skip_if_acked=True)
+                state["offers"]["n"] += 1
+                offered += 1
+            _save_sweep_state(state)
+        tail = ", {} chunk(s) failed".format(failed) if failed else ""
         if shadow:
             print("sweep (shadow — logged to {}, nothing offered): {} item(s){}".format(
-                display_path(home_dir() / "sweep.log"), shadow_items,
-                ", {} conversation(s) failed".format(failed) if failed else ""))
+                display_path(home_dir() / "sweep.log"), kept_total, tail))
         else:
-            print("sweep: {} offer(s){}".format(offered, ", {} conversation(s) failed".format(failed) if failed else ""))
+            print("sweep: {} offer(s) of {} item(s){}".format(offered, kept_total, tail))
         return 1 if failed else 0
 
 
