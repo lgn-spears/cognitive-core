@@ -70,7 +70,7 @@ it with `core loop add "<promise>"`.
 | `core search "query"` | search every day's ledger |
 | `core doctor` | health check: overdue loops, stale file references |
 | `core close` | silently mark activity (stop hooks) |
-| `core recall` | (UserPromptSubmit hook) cited memory lines for this message + undelivered results |
+| `core recall` | (UserPromptSubmit hook) cited memory lines for this message + undelivered results; `--reindex` builds the optional embedding index |
 | `core deliver "text" --source NAME [--key K]` | a background job hands a result to the inbox (same key while pending = same item) |
 | `core inbox` / `core inbox ack <id>` | list undelivered results / mark one as seen |
 | `core brief [--deliver]` | run the read-only audits in `audits/` — repos with no remote, unpushed work, scheduled jobs for work that has ended; `--deliver` puts each audit's findings in the inbox (one item per audit, updated on re-run) |
@@ -109,10 +109,25 @@ On Linux, the cron equivalent: `7 8 * * * $HOME/.local/bin/core run audits -- $H
   in System Settings → Privacy & Security. The audit never skips silently: it names every folder it
   couldn't look inside, so you can decide.
 
-**Recall is honest about what it is.** It matches words, weighted by how rare they are in *your* memory,
-and stays silent unless a match is strong. It finds things you name (a project, a tool, a client), and stays
-quiet when nothing matches strongly. It can't connect meaning across different words — a question about
-"the forecasting model I sent you" won't find a note titled "time-series foundation models". `tools/eval_recall.py` scores it against your own labeled messages.
+**Recall is honest about what it is.** Out of the box it matches words, weighted by how rare they are
+in *your* memory, and stays silent unless a match is strong. It finds things you name (a project, a tool,
+a client); it can't connect meaning across different words.
+
+**Optional: meaning-based recall** with any local embedding model served by Ollama (nothing leaves your
+machine). Add to `~/.core/recall.conf`:
+
+```
+embed_model qwen3-embedding:0.6b      # `ollama pull qwen3-embedding:0.6b` first (~640 MB)
+# embed_url http://localhost:11434    # default
+```
+
+then `core recall --reindex` once (about a minute for ~3,000 notes; later runs only re-embed what
+changed, and session start refreshes a stale index in the background). Recall then shows a note when
+its meaning stands out from your whole memory, or stands out moderately *and* the word matcher agrees.
+If the server is down or slow (>1s), recall silently falls back to words — it never blocks a session.
+Measured on 61 real, unseen messages with blind relevance judgments: stays silent 97% of the time when
+nothing is relevant, puts the right note in the top 3 for 77%, and 74% of what it shows is relevant
+(words alone: 90% / 74% / 51%). `tools/eval_recall.py` scores recall against your own labeled messages.
 
 **Heartbeats come first.** A schedule is not proof a job ran. `core inject` puts `HEARTBEAT ALARM:` lines
 right under its header, and `core brief` opens with `NOT RUNNING THAT SHOULD BE`.

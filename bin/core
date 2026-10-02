@@ -25,11 +25,13 @@ run a shell command can use this -- see README.
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import fcntl
 import hashlib
 import json
 import math
+import operator
 import os
 import re
 import signal
@@ -241,6 +243,7 @@ def cmd_inject(args) -> int:
         now_dt, last_seen, state["journal"], count_today(now_dt),
         loops=open_loops(), decisions=recent_decisions(), orders=standing_orders(),
     )
+    refresh_index_in_background()
     head, _, rest = block.partition("\n")
     alarm_lines = ["HEARTBEAT ALARM: {}".format(a) for a in safe_alarms()]
     print("\n".join([head] + alarm_lines + ([rest] if rest else [])))
@@ -628,16 +631,236 @@ def read_hook_prompt(raw: str) -> str:
     return ""
 
 
+# ---- optional meaning-based recall (embeddings from a local Ollama-compatible server) ----
+# Locked on real data (theseus evals): show a chunk whose similarity stands out from the whole memory
+# (z >= 5.0), or a moderately standing-out chunk (z >= 3.0) whose file the word matcher also found.
+EMBED_Z_STRONG = 5.0
+EMBED_Z_CONFIRMED = 3.0
+EMBED_TOP = 30
+EMBED_QUERY_TIMEOUT = 1.0
+EMBED_INSTRUCTION = ("Instruct: Given a message someone sent their coding assistant, retrieve personal memory "
+                     "notes that help answer it\nQuery: ")
+
+
+def embed_config():
+    model = (recall_conf_values("embed_model") or [""])[-1]
+    url = (recall_conf_values("embed_url") or ["http://localhost:11434"])[-1].rstrip("/")
+    return (model, url) if model else (None, None)
+
+
+def embed_texts(texts, model, url, timeout):
+    import urllib.request
+    req = urllib.request.Request(url + "/api/embed", data=json.dumps({"model": model, "input": texts}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        vecs = json.load(resp)["embeddings"]
+    return [unit(v) for v in vecs]
+
+
+def unit(v):
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def memory_chunks(path: Path):
+    """Paragraph chunks (<=1200 chars), each prefixed with the file's name so the name carries meaning."""
+    title = re.sub(r"[_\-]+", " ", path.stem)
+    lines = path.read_text(errors="replace").splitlines()
+    buf, start = [], None
+    for n, line in enumerate(lines + [""], 1):
+        if line.strip() and not LEDGER_NOISE_RE.match(line):
+            if start is None:
+                start = n
+            buf.append(line.strip())
+            if sum(len(b) for b in buf) < 1200:
+                continue
+        if buf:
+            yield start, chunk_preview(buf), "{}: {}".format(title, " ".join(buf))[:1400]
+        buf, start = [], None
+
+
+def chunk_preview(lines):
+    """The line worth showing: a frontmatter description if present, else the first real line."""
+    for l in lines:
+        if l.startswith("description:"):
+            return l[len("description:"):].strip().strip("'\"")[:300]
+    for l in lines:
+        if l != "---" and not re.match(r"^(name|metadata|type|node_type|aliases|originSessionId|modified):", l):
+            return l[:300]
+    return lines[0][:300]
+
+
+def index_paths():
+    return home_dir() / "recall-index.json", home_dir() / "recall-index.f32"
+
+
+def load_index(model):
+    """(meta, flat float array) for this model, or (None, None)."""
+    meta_p, vec_p = index_paths()
+    try:
+        meta = json.loads(meta_p.read_text())
+        if meta.get("model") != model:
+            return None, None
+        vecs = array.array("f")
+        with open(str(vec_p), "rb") as fh:
+            vecs.frombytes(fh.read())
+        if len(vecs) != meta["dim"] * len(meta["chunks"]):
+            return None, None
+        return meta, vecs
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+
+
+def reindex() -> int:
+    """Embed new/changed memory files; reuse vectors for unchanged ones. Returns chunks embedded."""
+    model, url = embed_config()
+    if not model:
+        print("core recall --reindex: set `embed_model <name>` in ~/.core/recall.conf first", file=sys.stderr)
+        return -1
+    with file_lock(home_dir() / "recall-index.lock", blocking=False) as got:
+        if not got:
+            print("reindex already running")
+            return 0
+        old_meta, old_vecs = load_index(model)
+        old = {}
+        if old_meta:
+            d = old_meta["dim"]
+            for k, c in enumerate(old_meta["chunks"]):
+                old.setdefault(c["path"], []).append((c, old_vecs[k * d:(k + 1) * d]))
+        files = recall_sources()
+        chunks, vecs, todo, embedded, dim = [], [], [], 0, old_meta["dim"] if old_meta else None
+        for f in files:
+            key = str(f)
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if old_meta and old_meta["files"].get(key) == mtime and key in old:
+                for c, v in old[key]:
+                    chunks.append(c)
+                    vecs.append(v)
+            else:
+                for line, preview, text in memory_chunks(f):
+                    chunks.append({"path": key, "line": line, "text": preview})
+                    vecs.append(None)
+                    todo.append((len(chunks) - 1, text))
+        for i in range(0, len(todo), 64):
+            batch = todo[i:i + 64]
+            out = embed_texts([t for _, t in batch], model, url, timeout=600)
+            for (k, _), v in zip(batch, out):
+                vecs[k] = v
+            embedded += len(batch)
+        if vecs and dim is None:
+            dim = len(vecs[0])
+        flat = array.array("f")
+        for v in vecs:
+            flat.extend(v)
+        meta = {"model": model, "dim": dim or 0, "chunks": chunks,
+                "files": {str(f): f.stat().st_mtime for f in files if f.exists()}}
+        meta_p, vec_p = index_paths()
+        home_dir().mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".recall-vec-")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(flat.tobytes())
+        os.replace(tmp, vec_p)
+        fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".recall-meta-")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(meta, fh)
+        os.replace(tmp, meta_p)
+        print("indexed {} chunks ({} embedded, {} reused)".format(len(chunks), embedded, len(chunks) - embedded))
+        return embedded
+
+
+def index_is_stale() -> bool:
+    model, _ = embed_config()
+    if not model:
+        return False
+    meta_p, _ = index_paths()
+    try:
+        built = meta_p.stat().st_mtime
+    except OSError:
+        return True
+    for f in recall_sources():
+        try:
+            if f.stat().st_mtime > built:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def refresh_index_in_background() -> None:
+    """Fire-and-forget incremental reindex; never blocks the session that triggered it."""
+    try:
+        if not index_is_stale():
+            return
+        log = home_dir() / "logs"
+        log.mkdir(parents=True, exist_ok=True)
+        with open(str(log / "recall-index.log"), "a") as out:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "recall", "--reindex"],
+                             stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def embedding_hits(text, lexical, limit=RECALL_MAX_HITS):
+    """The locked hybrid, or None when embeddings are off/unavailable (caller falls back to words)."""
+    model, url = embed_config()
+    if not model:
+        return None
+    meta, flat = load_index(model)
+    if not meta or not meta["chunks"]:
+        return None
+    try:
+        q = embed_texts([EMBED_INSTRUCTION + text], model, url, timeout=EMBED_QUERY_TIMEOUT)[0]
+    except Exception:
+        return None
+    d = meta["dim"]
+    if len(q) != d:
+        return None
+    sims = [sum(map(operator.mul, q, flat[k * d:(k + 1) * d])) for k in range(len(meta["chunks"]))]
+    mu = sum(sims) / len(sims)
+    sd = math.sqrt(sum((x - mu) ** 2 for x in sims) / len(sims)) or 1e-9
+    top = sorted(range(len(sims)), key=lambda k: -sims[k])[:EMBED_TOP]
+    lex_files = {str(f) for f, _, _ in lexical}
+    emb_files_confirmable = {meta["chunks"][k]["path"] for k in top if (sims[k] - mu) / sd >= EMBED_Z_CONFIRMED}
+    ordered = [k for k in top if (sims[k] - mu) / sd >= EMBED_Z_STRONG]
+    ordered += [k for k in top if EMBED_Z_CONFIRMED <= (sims[k] - mu) / sd < EMBED_Z_STRONG
+                and meta["chunks"][k]["path"] in lex_files]
+    cands = [(Path(meta["chunks"][k]["path"]), meta["chunks"][k]["line"], meta["chunks"][k]["text"]) for k in ordered]
+    cands += [h for h in lexical if str(h[0]) in emb_files_confirmable]
+    out, per = [], {}
+    for f, n, line in cands:
+        if per.get(str(f), 0) >= 2 or any(str(f) == str(o[0]) and n == o[1] for o in out):
+            continue
+        per[str(f)] = per.get(str(f), 0) + 1
+        out.append((f, n, line))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def recall_hits(text: str, files):
     """Exactly what the hook shows for a message: the gates (acknowledgements, non-person messages)
     plus ranking. The eval harness calls this, so it measures the live behaviour."""
     if not text or RECALL_ACK_RE.match(text) or NOT_FROM_PERSON_RE.search(text[:400]):
         return []
-    return recall_search(text, files)
+    lexical = recall_search(text, files)
+    try:
+        hybrid = embedding_hits(text, lexical)
+    except Exception:
+        hybrid = None
+    return lexical if hybrid is None else hybrid
 
 
 def cmd_recall(args) -> int:
     """Never breaks the session: memory and inbox fail independently; always exit 0."""
+    if getattr(args, "reindex", False):
+        try:
+            return 0 if reindex() >= 0 else 2
+        except Exception as e:
+            print("core recall --reindex failed: {}".format(e), file=sys.stderr)
+            return 1
     hits, inbox = [], []
     try:
         text = args.query or read_hook_prompt(sys.stdin.read() if not sys.stdin.isatty() else "")
@@ -1315,6 +1538,7 @@ def main(argv=None) -> int:
 
     p_recall = sub.add_parser("recall", help="(UserPromptSubmit hook) cited memory hits for this message")
     p_recall.add_argument("--query", help="search text instead of hook JSON on stdin")
+    p_recall.add_argument("--reindex", action="store_true", help="(embeddings) embed new/changed memory files")
     p_recall.set_defaults(func=cmd_recall)
 
     p_deliver = sub.add_parser("deliver", help="(background jobs) put a result in the inbox")
