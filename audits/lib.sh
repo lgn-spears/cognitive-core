@@ -80,10 +80,18 @@ unreadable_dirs() {  # names of top-level folders under the roots that can't be 
   done | sort -u
 }
 
+require_git() {  # a missing/broken git must be an audit FAILURE, never an all-clear
+  if ! out="$(git --version 2>&1)"; then
+    echo "git can't run here: $(printf '%s' "$out" | head -1)" >&2
+    exit 2
+  fi
+}
+
 unique_repos() {  # list_repos, with worktrees of the same repository collapsed to one entry
   list_repos | while IFS= read -r repo; do
     [ -n "$repo" ] || continue
-    common="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || continue
+    common="$(cd "$repo" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)"
+    [ -n "$common" ] || common="$repo"   # can't resolve: keep the repo, never drop it silently
     printf '%s\t%s\n' "$common" "$repo"
   done | awk -F '\t' '!seen[$1]++ { print $2 }'
 }

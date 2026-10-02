@@ -91,7 +91,7 @@ def test_bad_and_slow_audits_do_not_hide_the_rest(tmp_path):
     start = time.time()
     r = run_core(tmp_path, "brief", audits_dir=d, extra_env={"CORE_AUDIT_TIMEOUT": "1"})
     assert time.time() - start < 15
-    assert r.returncode == 0
+    assert r.returncode == 1  # a failed audit must not look like success to `core run` / the heartbeat
     assert "  real finding" in r.stdout
     assert "  ! audit bad.sh failed: boom" in r.stdout
     assert "  ! audit slow.sh timed out after 1s" in r.stdout
@@ -532,3 +532,57 @@ def test_audits_conf_trailing_comments(tmp_path):
     conf(tmp_path, "repo_root {}   # where I keep code\n".format(root))
     r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
     assert "  1 commit in 1 repo has no git remote at all." in r.stdout
+
+
+# ---- whole-system review fix pass ----
+
+def fake_git(tmp_path, body):
+    d = tmp_path / "fakegit"
+    write_audit(d, "git", body)
+    return d
+
+
+def test_missing_or_broken_git_is_an_error_not_all_clear(tmp_path):
+    # "Nothing needs you" when git can't run is a lie, and it would erase real inbox items.
+    d = two_audits(tmp_path, "3 repos lonely", "2 jobs")
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    root = tmp_path / "code"
+    make_repo(root / "lonely", 1)
+    conf(tmp_path, "repo_root {}\n".format(root))
+    broken = fake_git(tmp_path, "echo 'xcode-select: error: no developer tools' >&2; exit 1")
+    r = run_core(tmp_path, "brief", path_prefix=broken)
+    assert "nothing needs you" not in r.stdout
+    assert "! audit git-no-remote.sh failed" in r.stdout
+
+
+def test_failed_audit_makes_brief_fail_and_reaches_inbox(tmp_path):
+    d = tmp_path / "audits"
+    write_audit(d, "a.sh", r"printf '3 repos lonely\n'")
+    (d / "MANIFEST").write_text("a.sh  OPEN, NOBODY WAITING ON ME\n")
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    write_audit(d, "a.sh", "echo 'disk on fire' >&2; exit 3")
+    r = run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    assert r.returncode == 1
+    texts = [i["text"] for i in inbox_items(tmp_path) if i["status"] == "pending"]
+    assert texts == ["audit a.sh couldn't run: failed: disk on fire"]
+
+
+def test_acked_finding_is_not_renagged_without_change(tmp_path):
+    # Never repeat delivered content without a new signal.
+    d = two_audits(tmp_path, "3 repos lonely", "2 jobs")
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    for it in inbox_items(tmp_path):
+        run_core(tmp_path, "inbox", "ack", it["id"])
+    run_core(tmp_path, "brief", "--deliver", audits_dir=d)
+    assert [i for i in inbox_items(tmp_path) if i["status"] == "pending"] == []
+    run_core(tmp_path, "brief", "--deliver", audits_dir=two_audits(tmp_path, "4 repos lonely", "2 jobs"))
+    assert [i["text"] for i in inbox_items(tmp_path) if i["status"] == "pending"] == ["4 repos lonely — detail a"]
+
+
+def test_no_remote_names_the_repos(tmp_path):
+    root = tmp_path / "code"
+    for n in ("alpha", "bravo", "charlie"):
+        make_repo(root / n, 1)
+    conf(tmp_path, "repo_root {}\n".format(root))
+    r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
+    assert "Repos: alpha, bravo, charlie." in r.stdout

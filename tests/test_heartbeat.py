@@ -231,7 +231,9 @@ def test_next_run_refuses_while_orphaned_group_alive(tmp_path):
     # If the wrapper died hard, its job may still run: the next run must not overlap it or clear the alarm.
     passes(tmp_path, "expect a every 1d\n")
     orphan = subprocess.Popen(["sleep", "30"], start_new_session=True)
-    put_record(tmp_path, "a", status="running", started=ago(minutes=2), pgid=orphan.pid, last_line="")
+    run_core(tmp_path, "run", "probe", "--", "true")  # learn this boot's id
+    put_record(tmp_path, "a", status="running", started=ago(minutes=2), pgid=orphan.pid,
+               boot=records(tmp_path)["probe"]["boot"], last_line="")
     r = run_core(tmp_path, "run", "a", "--", "echo", "second")
     hb = run_core(tmp_path, "heartbeat")
     orphan.kill(); orphan.wait()
@@ -329,3 +331,38 @@ def test_heartbeat_check_never_takes_the_lease(tmp_path):
         os.chmod(str(lease), 0o644)
     assert "Traceback" not in r.stderr
     assert "audits started 1 min ago and never finished" in r.stdout
+
+
+def test_pgid_from_previous_boot_does_not_block(tmp_path):
+    # After a reboot, a recorded process group number may belong to anything; it must not block forever.
+    other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    put_record(tmp_path, "job", status="running", started=ago(hours=2), pgid=other.pid, boot="0-old-boot",
+               last_line="")
+    r = run_core(tmp_path, "run", "job", "--", "echo", "hello")
+    other.kill(); other.wait()
+    assert r.returncode == 0 and "hello" in r.stdout
+    assert records(tmp_path)["job"]["status"] == "ok"
+
+
+def test_blocked_run_exits_nonzero_and_says_how_to_clear(tmp_path):
+    passes(tmp_path, "expect job every 1d\n")
+    orphan = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    run_core(tmp_path, "run", "probe", "--", "true")
+    current_boot = records(tmp_path)["probe"].get("boot")
+    put_record(tmp_path, "job", status="running", started=ago(minutes=3), pgid=orphan.pid, boot=current_boot,
+               last_line="")
+    r = run_core(tmp_path, "run", "job", "--", "echo", "x")
+    hb = run_core(tmp_path, "heartbeat").stdout
+    orphan.kill(); orphan.wait()
+    assert r.returncode == 75 and "skipped" in r.stdout
+    assert "kill -9 -{}".format(orphan.pid) in hb
+
+
+def test_corrupt_heartbeat_file_is_reported_and_preserved(tmp_path):
+    passes(tmp_path, "expect a every 1d\n")
+    h = tmp_path / "corehome"
+    (h / "heartbeat.json").write_text("{corrupt")
+    hb = run_core(tmp_path, "heartbeat").stdout
+    assert "run records are unreadable" in hb
+    run_core(tmp_path, "run", "a", "--", "true")
+    assert list(h.glob("heartbeat.json.corrupt-*")), "corrupt history must be kept, not overwritten"

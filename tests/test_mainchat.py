@@ -381,3 +381,37 @@ def test_doctor_warns_about_missing_memory_dirs(tmp_path):
     (h / "recall.conf").write_text("memory_dir {}\n".format(tmp_path / "nope"))
     r = run_core(tmp_path, "doctor")
     assert "recall.conf memory_dir does not exist: {}".format(tmp_path / "nope") in r.stdout
+
+
+def test_loop_done_and_add_reject_empty_text(tmp_path):
+    run_core(tmp_path, "loop", "add", "ship v1")
+    run_core(tmp_path, "loop", "add", "email the vendor")
+    r = run_core(tmp_path, "loop", "done")
+    assert r.returncode == 2
+    assert run_core(tmp_path, "loop", "add").returncode == 2
+    assert "ship v1" in run_core(tmp_path, "loop", "list").stdout
+
+
+def test_fresh_core_home_commands_do_not_crash(tmp_path):
+    for args in (["decision", "chose sqlite"], ["loop", "add", "x"], ["loop", "list"], ["doctor"]):
+        r = run_core(tmp_path, *args)
+        assert "Traceback" not in r.stderr, args
+
+
+def test_recall_small_memory_file_names_and_plurals(tmp_path):
+    mem = tmp_path / "mem"
+    for i in range(20):
+        write_mem(mem, "note{}.md".format(i), "an unrelated note number {}\n".format(i))
+    write_mem(mem, "project_redis.md", "Cache provider is Upstash, region us-east\n")
+    write_mem(mem, "standups.md", "Weekly meetings are Tuesdays at 10\n")
+    conf(tmp_path, mem)
+    assert "project_redis.md" in run_core(tmp_path, "recall", stdin=prompt("which redis provider do we use")).stdout
+    assert "standups.md" in run_core(tmp_path, "recall", stdin=prompt("when is the weekly meeting")).stdout
+
+
+def test_recall_ignores_session_start_ledger_noise(tmp_path):
+    h = tmp_path / "corehome"
+    (h / "days").mkdir(parents=True)
+    (h / "days" / "2026-10-01.log").write_text("[09:00] session start (proj)\n[09:05] session start (other)\n")
+    r = run_core(tmp_path, "recall", stdin=prompt("when did the session start"))
+    assert "session start (proj)" not in r.stdout

@@ -2,6 +2,7 @@
 # Repos that have a remote but hold commits no remote branch contains.
 set -u
 . "${CORE_AUDITS_LIB:-$(dirname "$0")/lib.sh}"
+require_git
 
 SHOW=5
 rows=""

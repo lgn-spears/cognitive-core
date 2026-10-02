@@ -67,12 +67,14 @@ def days_dir() -> Path:
 
 
 def decisions_file() -> Path:
+    home_dir().mkdir(parents=True, exist_ok=True)
     f = home_dir() / "decisions.log"
     f.touch(exist_ok=True)
     return f
 
 
 def loops_file() -> Path:
+    home_dir().mkdir(parents=True, exist_ok=True)
     f = home_dir() / "loops.md"
     f.touch(exist_ok=True)
     return f
@@ -277,6 +279,10 @@ def cmd_log(args) -> int:
 
 def cmd_loop(args) -> int:
     now_dt = now()
+    if args.loop_cmd in ("add", "done") and not args.text.strip():
+        print("usage: core loop {} \"text\"  (an empty match would {} every loop)".format(
+            args.loop_cmd, "open a junk" if args.loop_cmd == "add" else "close"), file=sys.stderr)
+        return 2
     if args.loop_cmd == "add":
         entry = "- [ ] {} {}".format(
             args.due or now_dt.strftime("%Y-%m-%d"), args.text
@@ -463,11 +469,24 @@ def one_line(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+LEDGER_NOISE_RE = re.compile(r"^\[\d\d:\d\d\] session start \(")
+
+
+def stem(w: str) -> str:
+    """Light plural folding so "meeting" finds "meetings" (not a full stemmer, on purpose)."""
+    if len(w) > 4 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    return w
+
+
 def recall_terms(text: str):
     """Distinct meaningful lowercase tokens, in order, capped."""
     out, seen = [], set()
     for w in TOKEN_RE.findall(text.lower()):
-        if len(w) >= 3 and w not in RECALL_STOPWORDS and w not in seen:
+        if len(w) >= 3 and w not in RECALL_STOPWORDS:
+            w = stem(w)
+            if w in seen:
+                continue
             seen.add(w)
             out.append(w)
             if len(out) >= RECALL_MAX_TERMS:
@@ -537,9 +556,9 @@ def recall_search(text: str, files, limit: int = RECALL_MAX_HITS, min_score: flo
         except OSError:
             continue
         for n, line in enumerate(lines, 1):
-            if not line.strip():
+            if not line.strip() or LEDGER_NOISE_RE.match(line):
                 continue
-            toks = TOKEN_RE.findall(line.lower())
+            toks = [stem(t) for t in TOKEN_RE.findall(line.lower())]
             present = term_set.intersection(toks)
             for t in present:
                 df[t] += 1
@@ -548,13 +567,17 @@ def recall_search(text: str, files, limit: int = RECALL_MAX_HITS, min_score: flo
     idf = {t: math.log(1 + total / df[t]) for t in terms if df[t]}
     if min_score is None:
         min_score = RECALL_MIN_FRACTION * 2 * math.log(1 + total)
-    rare = {t for t in idf if len(t) >= 4 and idf[t] >= math.log(101)}  # in under 1% of lines
+    rare = {t for t in idf if len(t) >= 4 and df[t] <= max(1, total * 0.01)}  # in under 1% of lines
+    name_only = {t for t in terms if len(t) >= 4 and not df[t]}  # appears in no line, maybe in a file name
     named = {}  # file -> rare terms found in its name
     for f in {c[0] for c in corpus}:
-        stem = norm_stem(f)
-        hit = {t for t in rare if re.sub(r"[^a-z0-9]", "", t) in stem}
+        fstem = norm_stem(f)
+        hit = {t for t in rare | name_only if re.sub(r"[^a-z0-9]", "", t) in fstem}
         if hit:
             named[f] = hit
+    for t in name_only:
+        if any(t in h for h in named.values()):
+            idf[t] = math.log(1 + total)
     need = max(2, min(6, math.ceil(len(terms) * 0.2)))
     scored = []
     for f, n, line, present, ntok in corpus:
@@ -562,7 +585,8 @@ def recall_search(text: str, files, limit: int = RECALL_MAX_HITS, min_score: flo
         bonus = named.get(f, set())
         if len(weighted) < need and not bonus:
             continue
-        s = sum(idf[t] for t in weighted) + sum(idf[t] for t in bonus)
+        # A word found only in a file's name gets extra weight (it can't also score in the text).
+        s = sum(idf[t] for t in weighted) + sum(idf[t] * (1.5 if t in name_only else 1.0) for t in bonus)
         s /= 1 + 0.25 * math.log(1 + ntok / 20)
         if s >= min_score:
             scored.append((s, f, n, line))
@@ -731,7 +755,7 @@ def render_inbox(items):
     return lines
 
 
-def deliver_item(text: str, source: str, key: str = "", replace: bool = False) -> str:
+def deliver_item(text: str, source: str, key: str = "", replace: bool = False, skip_if_acked: bool = False) -> str:
     """Put one result in the inbox; returns its id. Same key while pending = same item
     (with replace=True its text is updated to what is true now)."""
     text, source = valid_utf8(text), valid_utf8(source)
@@ -744,6 +768,10 @@ def deliver_item(text: str, source: str, key: str = "", replace: bool = False) -
                     it.update(text=text, source=source, at=now().isoformat(timespec="seconds"))
                     write_item(it)
                 return it["id"]
+        if skip_if_acked:  # the person already saw exactly this; repeating it adds nothing
+            seen = [it for it in read_inbox() if it["key"] == key and it["status"] == "acked"]
+            if seen and seen[-1]["text"] == text:
+                return seen[-1]["id"]
         now_dt = now()
         item = {
             "id": "{}-{}".format(now_dt.strftime("%Y%m%d%H%M%S"), os.urandom(3).hex()),
@@ -917,12 +945,14 @@ def cmd_brief(args) -> int:
     if getattr(args, "deliver", False):
         for heading, findings, error, script in results:
             key = "audit:{}".format(script)
-            if findings:
+            if error:
+                deliver_item("audit {} couldn't run: {}".format(script, error), "audits", key, replace=True)
+            elif findings:
                 deliver_item(" · ".join(head + (" — " + detail if detail else "") for head, detail in findings),
-                             "audits", key, replace=True)
-            elif not error:
+                             "audits", key, replace=True, skip_if_acked=True)
+            else:
                 resolve_items(key)  # the problem is gone: stop telling the agent it exists
-    return 0
+    return 1 if any(error for _, _, error, _ in results) else 0
 
 
 HEARTBEAT_GRACE = 1.5  # overdue when the last finish is older than 1.5 x the expected interval
@@ -952,6 +982,24 @@ def lease_path(name: str) -> Path:
     return home_dir() / "leases" / (name + ".lock")
 
 
+def boot_id() -> str:
+    """Identifies this boot, so process ids recorded before a reboot are never trusted after it."""
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=2).stdout
+        m = re.search(r"sec = (\d+)", out)
+        if m:
+            return "mac-" + m.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        for line in open("/proc/stat"):
+            if line.startswith("btime"):
+                return "linux-" + line.split()[1]
+    except OSError:
+        pass
+    return "unknown"
+
+
 def wrapper_alive(rec: dict) -> bool:
     """Is the `core run` that wrote this record still alive? Checked by pid, never by taking the
     lease: probing the lock would make a run starting at that instant skip itself."""
@@ -967,6 +1015,16 @@ def wrapper_alive(rec: dict) -> bool:
         return False
 
 
+def heartbeat_corrupt() -> bool:
+    p = home_dir() / "heartbeat.json"
+    if not p.exists():
+        return False
+    try:
+        return not isinstance(json.loads(p.read_text()), dict)
+    except (OSError, ValueError):
+        return True
+
+
 def read_heartbeats() -> dict:
     try:
         data = json.loads((home_dir() / "heartbeat.json").read_text())
@@ -977,6 +1035,9 @@ def read_heartbeats() -> dict:
 
 def record_heartbeat(name: str, rec: dict) -> None:
     with file_lock(home_dir() / "heartbeat.lock"):
+        if heartbeat_corrupt():  # keep the unreadable history for a human; never overwrite it silently
+            p = home_dir() / "heartbeat.json"
+            os.replace(p, home_dir() / "heartbeat.json.corrupt-{}".format(now().strftime("%Y%m%d%H%M%S")))
         data = read_heartbeats()
         data[name] = rec
         fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".heartbeat-")
@@ -1081,17 +1142,21 @@ def run_supervised(name: str, cmd, timeout: int) -> int:
             print("skipped: {} is already running".format(name))
             return 0
         prev = read_heartbeats().get(name, {})
-        if prev.get("status") == "running" and group_alive(prev.get("pgid")):
-            print("skipped: {}'s previous run (process group {}) is still alive".format(name, prev.get("pgid")))
-            return 0
+        if (prev.get("status") == "running" and prev.get("boot") == boot_id()
+                and group_alive(prev.get("pgid"))):
+            print("skipped: {}'s previous run (process group {}) is still alive; to clear it: kill -9 -{}".format(
+                name, prev.get("pgid"), prev.get("pgid")))
+            return 75
         started = now().isoformat(timespec="seconds")
-        record_heartbeat(name, {"status": "running", "started": started, "pid": os.getpid(), "last_line": ""})
+        boot = boot_id()
+        record_heartbeat(name, {"status": "running", "started": started, "pid": os.getpid(), "boot": boot,
+                                "last_line": ""})
         child = {}
 
         def on_start(proc):
             child["pgid"] = proc.pid
             record_heartbeat(name, {"status": "running", "started": started, "pid": os.getpid(),
-                                    "pgid": proc.pid, "last_line": ""})
+                                    "pgid": proc.pid, "boot": boot, "last_line": ""})
 
         def on_signal(signum, frame):
             if "pgid" in child:
@@ -1104,7 +1169,7 @@ def run_supervised(name: str, cmd, timeout: int) -> int:
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             signal.signal(sig, on_signal)
         status, code, last = run_command(cmd, timeout, on_start)
-        record_heartbeat(name, {"status": status, "exit": code, "started": started,
+        record_heartbeat(name, {"status": status, "exit": code, "started": started, "boot": boot,
                                 "finished": now().isoformat(timespec="seconds"), "last_line": last})
         return code
 
@@ -1143,6 +1208,8 @@ def heartbeat_alarms():
     """One line per pass that never ran, failed, timed out, was killed, hung, died mid-run, or is overdue."""
     recs, now_dt = read_heartbeats(), now()
     expects, alarms = read_expectations()
+    if expects and heartbeat_corrupt():
+        alarms.append("run records are unreadable (heartbeat.json is corrupt) — the alarms below may be wrong")
     expected_names = {name for name, _, _ in expects}
     stray = sorted(set(recs) - expected_names)
     for name, seconds, every in expects:
@@ -1162,7 +1229,11 @@ def heartbeat_alarms():
             continue
         if status == "running":
             if not wrapper_alive(rec):
-                alarms.append("{} started {} and never finished".format(name, human_gap(now_dt - started)))
+                tail = ""
+                if rec.get("boot") == boot_id() and group_alive(rec.get("pgid")):
+                    tail = "; its job is still running unsupervised and blocks new runs — to clear: kill -9 -{}".format(
+                        rec.get("pgid"))
+                alarms.append("{} started {} and never finished{}".format(name, human_gap(now_dt - started), tail))
             elif (now_dt - started).total_seconds() > seconds * HEARTBEAT_GRACE:
                 alarms.append("{} has been running for {} (expected every {}) — may be hung".format(
                     name, human_gap(now_dt - started).replace(" ago", ""), every))
