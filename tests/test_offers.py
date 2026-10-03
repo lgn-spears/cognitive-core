@@ -114,3 +114,52 @@ def test_only_the_current_extractor_version_can_pause_a_type():
     old = [{"outcome": "declined", "tags": {"type": "correction", "v": "old"}}] * 8
     assert not core.learn_offer_types(old, version="new").get("correction", {}).get("paused")
     assert core.learn_offer_types(old)["correction"]["paused"]
+
+
+# ---- GLM review fixes ----
+
+def test_parallel_readers_log_an_expiry_once(tmp_path):
+    ids = [offer(tmp_path, "offer {} text".format(i), key="e{}".format(i)) for i in range(10)]
+    for oid in ids:
+        p = tmp_path / "corehome" / "inbox" / (oid + ".json")
+        d = json.loads(p.read_text()); d["at"] = (datetime.now() - timedelta(days=8)).isoformat(timespec="seconds")
+        p.write_text(json.dumps(d))
+    env = {"HOME": str(tmp_path), "CORE_HOME": str(tmp_path / "corehome"), "PATH": os.environ["PATH"]}
+    procs = [subprocess.Popen(["python3", str(CORE), "inbox"], env=env, stdout=subprocess.DEVNULL) for _ in range(12)]
+    for p in procs:
+        p.wait()
+    rows = [o for o in outcomes(tmp_path) if o["outcome"] == "unanswered"]
+    assert len(rows) == 10 and len({o["id"] for o in rows}) == 10
+
+
+def test_ack_refuses_an_offer(tmp_path):
+    oid = offer(tmp_path)
+    r = run(tmp_path, "inbox", "ack", oid)
+    assert r.returncode != 0 and "core offer" in r.stderr
+    assert oid in run(tmp_path, "inbox").stdout
+
+
+def test_later_restarts_the_week(tmp_path):
+    oid = offer(tmp_path)
+    p = tmp_path / "corehome" / "inbox" / (oid + ".json")
+    d = json.loads(p.read_text()); d["at"] = (datetime.now() - timedelta(days=6)).isoformat(timespec="seconds")
+    p.write_text(json.dumps(d))
+    run(tmp_path, "offer", "later", oid)
+    d = json.loads(p.read_text()); d["until"] = (datetime.now() - timedelta(minutes=1)).isoformat(timespec="seconds")
+    p.write_text(json.dumps(d))
+    assert oid in run(tmp_path, "inbox").stdout  # asked again, not expired
+
+
+def test_stats_survive_a_bad_line(tmp_path):
+    a = offer(tmp_path, key="s1")
+    run(tmp_path, "offer", "yes", a)
+    with open(str(tmp_path / "corehome" / "offer-outcomes.jsonl"), "a") as fh:
+        fh.write("garbage\n{\"id\": \"x\"}\n")
+    r = run(tmp_path, "offer", "stats")
+    assert r.returncode == 0 and "1 yes" in r.stdout
+
+
+def test_offer_upgrades_a_plain_item_with_the_same_key(tmp_path):
+    plain = run(tmp_path, "deliver", "a report", "--source", "sweep", "--key", "same").stdout.strip()
+    again = run(tmp_path, "deliver", "a report", "--source", "sweep", "--key", "same", "--offer").stdout.strip()
+    assert again == plain and run(tmp_path, "offer", "yes", again).returncode == 0

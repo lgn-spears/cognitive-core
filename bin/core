@@ -1764,16 +1764,33 @@ def inbox_dir() -> Path:
     return home_dir() / "inbox"
 
 
-@contextlib.contextmanager
+_INBOX_LOCK_DEPTH = [0]
+
+
 def inbox_lock():
-    """Serialize every inbox read-modify-write across processes (parallel sessions, parallel jobs)."""
+    """Serialize every inbox read-modify-write across processes (parallel sessions, parallel jobs).
+    Re-entrant within one process (deliver_item → pending_inbox both take it)."""
+    return _inbox_lock_cm()
+
+
+@contextlib.contextmanager
+def _inbox_lock_cm():
+    if _INBOX_LOCK_DEPTH[0]:
+        _INBOX_LOCK_DEPTH[0] += 1
+        try:
+            yield
+        finally:
+            _INBOX_LOCK_DEPTH[0] -= 1
+        return
     d = inbox_dir()
     d.mkdir(parents=True, exist_ok=True)
     with open(str(d / ".lock"), "a") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
+        _INBOX_LOCK_DEPTH[0] = 1
         try:
             yield
         finally:
+            _INBOX_LOCK_DEPTH[0] = 0
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
@@ -1820,19 +1837,26 @@ def pending_inbox():
     """Pending items, after two lazy transitions: a deferred offer whose time has come is pending again,
     and an offer nobody answered for a week expires as 'unanswered' (silence is never a yes or a no)."""
     out, now_dt = [], now()
-    for it in read_inbox():
-        st = it["status"]
-        if st == "deferred" and _past(it.get("until"), now_dt):
-            it["status"] = st = "pending"
-            write_item(it)
-        if st == "pending" and it.get("kind") == "offer" and _older_than(it.get("at"), now_dt, OFFER_EXPIRE_DAYS):
-            it["status"] = "unanswered"
-            write_item(it)
-            log_outcome(it, "unanswered")
-            continue
-        if st == "pending":
-            out.append(it)
-    return out
+    items = read_inbox()
+    due = [it for it in items if (it["status"] == "deferred" and _past(it.get("until"), now_dt)) or
+           (it["status"] == "pending" and it.get("kind") == "offer" and _older_than(it.get("at"), now_dt, OFFER_EXPIRE_DAYS))]
+    if due:
+        with inbox_lock():  # transitions are read-modify-write: one process, once
+            for it in due:
+                cur = read_item(inbox_dir() / (it["id"] + ".json"))
+                if not cur:
+                    continue
+                if cur["status"] == "deferred" and _past(cur.get("until"), now_dt):
+                    cur["status"] = "pending"
+                    cur["at"] = now_dt.isoformat(timespec="seconds")  # asked again: a fresh week to answer
+                    write_item(cur)
+                elif (cur["status"] == "pending" and cur.get("kind") == "offer"
+                      and _older_than(cur.get("at"), now_dt, OFFER_EXPIRE_DAYS)):
+                    cur["status"] = "unanswered"
+                    write_item(cur)
+                    log_outcome(cur, "unanswered")
+        items = read_inbox()
+    return [it for it in items if it["status"] == "pending"]
 
 
 def _when(ts):
@@ -1924,6 +1948,11 @@ def deliver_item(text: str, source: str, key: str = "", replace: bool = False, s
     with inbox_lock():
         for it in pending_inbox():
             if it["key"] == key:
+                if offer and it.get("kind") != "offer":
+                    it["kind"] = "offer"
+                    if tags:
+                        it["tags"] = {str(k): str(v) for k, v in tags.items()}
+                    write_item(it)
                 if replace and (it["text"] != text or it["source"] != source):
                     it.update(text=text, source=source, at=now().isoformat(timespec="seconds"))
                     write_item(it)
@@ -2039,10 +2068,20 @@ LEARN_PAUSE_BELOW = 0.15
 
 
 def read_outcomes():
+    rows = []
     try:
-        return [json.loads(l) for l in open(str(outcomes_path())) if l.strip()]
-    except (OSError, ValueError):
-        return []
+        fh = open(str(outcomes_path()))
+    except OSError:
+        return rows
+    with fh:
+        for l in fh:
+            try:
+                r = json.loads(l)
+            except ValueError:
+                continue  # one bad line never hides the rest
+            if isinstance(r, dict) and r.get("outcome"):
+                rows.append(r)
+    return rows
 
 
 def learn_offer_types(rows, version=None):
@@ -2080,8 +2119,8 @@ def cmd_offer(args) -> int:
             return 0
         by = {}
         for r in rows:
-            by.setdefault(r.get("source") or "?", {}).setdefault(r["outcome"], 0)
-            by[r.get("source") or "?"][r["outcome"]] += 1
+            c = by.setdefault(r.get("source") or "?", {})
+            c[r["outcome"]] = c.get(r["outcome"], 0) + 1
         inv = {v: k for k, v in ANSWERS.items()}
         for src, c in sorted(by.items()):
             answered = c.get("accepted", 0) + c.get("declined", 0) + c.get("never", 0)
@@ -2159,6 +2198,10 @@ def cmd_inbox(args) -> int:
         if ITEM_ID_RE.match(item_id):
             with inbox_lock():
                 cur = read_item(inbox_dir() / (item_id + ".json"))
+                if cur and cur.get("kind") == "offer":
+                    print("{} is an offer: record the person's answer with `core offer yes|no|later|never {}`".format(
+                        item_id, item_id), file=sys.stderr)
+                    return 1
                 if cur:
                     cur["status"] = "acked"
                     cur["acked_at"] = now().isoformat(timespec="seconds")
