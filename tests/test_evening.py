@@ -88,3 +88,19 @@ def test_nothing_good_means_no_offer(tmp_path, model):
     Fake.reply = {"offer": None}
     run(tmp_path, "evening")
     assert " offer," not in run(tmp_path, "inbox").stdout
+
+
+def test_evidence_must_be_one_real_line_not_a_splice(tmp_path, model):
+    setup_day(tmp_path, model)
+    Fake.reply = {"offer": {"text": "Two loops are related.", "evidence": ["renew the client's domain open loop (due"]}}
+    run(tmp_path, "evening")
+    assert "Two loops are related" not in run(tmp_path, "inbox").stdout
+
+
+def test_evening_survives_a_bad_byte(tmp_path):
+    setup_day(tmp_path)
+    from datetime import date
+    with open(str(tmp_path / "corehome" / "days" / (date.today().isoformat() + ".log")), "ab") as fh:
+        fh.write(b"[21:00] x \xff\xfe\n")
+    r = run(tmp_path, "evening")
+    assert r.returncode == 0 and "Evening wrap" in run(tmp_path, "inbox").stdout

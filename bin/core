@@ -210,7 +210,7 @@ def render_block(now_dt: datetime, last_seen, entries, today_count: int = 0, loo
 def open_loops():
     """Unclosed loops as (text, opened_date), oldest first."""
     out = []
-    for line in loops_file().read_text().splitlines():
+    for line in loops_file().read_text(errors="replace").splitlines():
         stripped = line.strip()
         if stripped.startswith("- [ ]"):
             body = stripped[5:].strip()
@@ -220,7 +220,7 @@ def open_loops():
 
 
 def recent_decisions():
-    return [ln for ln in decisions_file().read_text().splitlines() if ln.strip()]
+    return [ln for ln in decisions_file().read_text(errors="replace").splitlines() if ln.strip()]
 
 
 def count_today(now_dt: datetime) -> int:
@@ -1742,20 +1742,20 @@ or {{"offer": null}}. Every evidence entry must be copied exactly from the conte
 def evening_context(today):
     lines = []
     try:
-        lines += [l for l in (days_dir() / (today + ".log")).read_text().splitlines()
+        lines += [l for l in (days_dir() / (today + ".log")).read_text(errors="replace").splitlines()
                   if l.strip() and not LEDGER_NOISE_RE.match(l)]
     except OSError:
         pass
     lines += ["open loop (due {}): {}".format(d, t) for t, d in open_loops()]
     lines += ["decision: " + d for d in recent_decisions()[-15:]]
-    lines += ["waiting in inbox: " + one_line(it["text"], 160) for it in pending_inbox()]
+    lines += ["waiting in inbox: " + one_line(it["text"], 160) for it in pending_inbox() if it.get("source") != "evening"]
     return lines[-120:]
 
 
 def evening_wrap(today):
     page = []
     try:
-        page = (days_dir() / (today + ".log")).read_text().splitlines()
+        page = (days_dir() / (today + ".log")).read_text(errors="replace").splitlines()
     except OSError:
         pass
     decided = [l.split("decision: ", 1)[1] for l in page if "decision: " in l]
@@ -1776,7 +1776,14 @@ def evening_wrap(today):
     if others:
         parts.append("{} other item(s) still unread".format(others))
     parts.append("not running: " + "; ".join(alarms[:2]) if alarms else "background jobs healthy")
-    return "Evening wrap ({}): ".format(today) + " · ".join(parts)
+    text = "Evening wrap ({}): ".format(today) + " · ".join(parts)
+    while len(text) > INBOX_TEXT_CHARS and len(parts) > 1:  # trim the named lists, keep the counts
+        parts[0] = parts[0][: max(20, len(parts[0]) - (len(text) - INBOX_TEXT_CHARS) - 1)] + "…"
+        text = "Evening wrap ({}): ".format(today) + " · ".join(parts)
+        if len(parts[0]) <= 21:
+            parts.pop(0)
+            text = "Evening wrap ({}): ".format(today) + " · ".join(parts)
+    return text
 
 
 def evening_insight(today, context):
@@ -1791,8 +1798,8 @@ def evening_insight(today, context):
     if not isinstance(off, dict) or not isinstance(off.get("text"), str):
         return None
     ev = [e for e in off.get("evidence") or [] if isinstance(e, str) and e.strip()]
-    ctx = _squash("\n".join(context))
-    if not ev or any(_squash(e) not in ctx for e in ev) or not statement_ok(off["text"]):
+    lines_sq = [_squash(c) for c in context]
+    if not ev or any(not any(_squash(e) in c for c in lines_sq) for e in ev) or not statement_ok(off["text"]):
         return None  # ungrounded, or instruction-shaped: noise by definition
     return off["text"].strip(), ev
 
@@ -2035,6 +2042,7 @@ def deliver_item(text: str, source: str, key: str = "", replace: bool = False, s
             if it["key"] == key:
                 if offer and it.get("kind") != "offer":
                     it["kind"] = "offer"
+                    it["at"] = now().isoformat(timespec="seconds")  # its week starts when it becomes a question
                     if tags:
                         it["tags"] = {str(k): str(v) for k, v in tags.items()}
                     write_item(it)
@@ -2044,7 +2052,7 @@ def deliver_item(text: str, source: str, key: str = "", replace: bool = False, s
                 return it["id"]
         if offer:  # an offer the person already answered (yes/no/never, or deferred) is never re-asked
             answered = [it for it in read_inbox() if it["key"] == key and it["status"] in
-                        ("accepted", "declined", "never", "deferred")]
+                        ("accepted", "declined", "never", "deferred", "unanswered")]
             if answered:
                 return answered[-1]["id"]
         if skip_if_acked:  # the person already saw exactly this; repeating it adds nothing
@@ -2237,7 +2245,7 @@ def cmd_offer(args) -> int:
             cur["until"] = (now() + timedelta(days=OFFER_DEFER_DAYS)).isoformat(timespec="seconds")
         write_item(cur)
         log_outcome(cur, outcome, args.note or "")
-        if scope and outcome == "accepted":
+        if scope and outcome == "accepted":  # still inside inbox_lock: grant writes are serialized
             g = read_grants()
             g[scope] = {"granted_at": now().isoformat(timespec="seconds"), "words": args.note.strip(),
                         "offer": oid, "revoke": "core grant revoke " + scope}
@@ -2248,7 +2256,22 @@ def cmd_offer(args) -> int:
     return 0
 
 
+def _revoke_grant(scope) -> int:
+    g = read_grants()
+    if not scope or scope not in g:
+        print("core grant: no standing permission {!r}".format(scope), file=sys.stderr)
+        return 1
+    del g[scope]
+    write_grants(g)
+    append_ledger(now(), "standing permission revoked: " + scope)
+    print("revoked " + scope)
+    return 0
+
+
 def cmd_grant(args) -> int:
+    if args.grant_cmd == "revoke":
+        with inbox_lock():
+            return _revoke_grant(args.scope)
     g = read_grants()
     if args.grant_cmd == "revoke":
         if not args.scope or args.scope not in g:
