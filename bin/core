@@ -1727,6 +1727,91 @@ def cmd_sweep(args) -> int:
         return 1 if failed else 0
 
 
+# ---- the evening pass: a wrap for tomorrow + at most one insight that must cite its evidence ----
+INSIGHT_PROMPT = """You are a careful personal assistant reviewing the person's day. Context lines (verbatim):
+{context}
+
+Offer AT MOST ONE thing worth their attention tomorrow, and only if it contains a fact they didn't have or a
+connection between two things they hadn't joined (e.g. two open items about the same client, a decision that
+conflicts with a loop, something overdue that blocks something else). Generic advice, reminders of a single
+item, or anything not grounded in these lines is noise: answer {{"offer": null}}.
+Reply with only JSON: {{"offer": {{"text": "<one or two plain sentences>", "evidence": ["<exact line>", ...]}}}}
+or {{"offer": null}}. Every evidence entry must be copied exactly from the context lines."""
+
+
+def evening_context(today):
+    lines = []
+    try:
+        lines += [l for l in (days_dir() / (today + ".log")).read_text().splitlines()
+                  if l.strip() and not LEDGER_NOISE_RE.match(l)]
+    except OSError:
+        pass
+    lines += ["open loop (due {}): {}".format(d, t) for t, d in open_loops()]
+    lines += ["decision: " + d for d in recent_decisions()[-15:]]
+    lines += ["waiting in inbox: " + one_line(it["text"], 160) for it in pending_inbox()]
+    return lines[-120:]
+
+
+def evening_wrap(today):
+    page = []
+    try:
+        page = (days_dir() / (today + ".log")).read_text().splitlines()
+    except OSError:
+        pass
+    decided = [l.split("decision: ", 1)[1] for l in page if "decision: " in l]
+    loops = open_loops()
+    overdue = [t for t, d in loops if d < today]
+    waiting = pending_inbox()
+    offers = [it for it in waiting if it.get("kind") == "offer"]
+    alarms = safe_alarms()
+    parts = []
+    if decided:
+        parts.append("decided today: " + "; ".join(one_line(d, 70) for d in decided[:3]))
+    if overdue:
+        parts.append("overdue: " + "; ".join(one_line(t, 50) for t in overdue[:3]))
+    parts.append("{} open loop(s)".format(len(loops)))
+    if offers:
+        parts.append("{} offer(s) waiting for an answer".format(len(offers)))
+    others = len(waiting) - len(offers)
+    if others:
+        parts.append("{} other item(s) still unread".format(others))
+    parts.append("not running: " + "; ".join(alarms[:2]) if alarms else "background jobs healthy")
+    return "Evening wrap ({}): ".format(today) + " · ".join(parts)
+
+
+def evening_insight(today, context):
+    model, url, api = sweep_config()
+    if not model or not context:
+        return None
+    try:
+        v = model_json(INSIGHT_PROMPT.format(context="\n".join(context)), model, url, api=api, timeout=300)
+    except Exception:
+        return None
+    off = v.get("offer") if isinstance(v, dict) else None
+    if not isinstance(off, dict) or not isinstance(off.get("text"), str):
+        return None
+    ev = [e for e in off.get("evidence") or [] if isinstance(e, str) and e.strip()]
+    ctx = _squash("\n".join(context))
+    if not ev or any(_squash(e) not in ctx for e in ev) or not statement_ok(off["text"]):
+        return None  # ungrounded, or instruction-shaped: noise by definition
+    return off["text"].strip(), ev
+
+
+def cmd_evening(args) -> int:
+    """Nightly: deliver a short wrap for tomorrow (counts and names, not a re-run of the morning check),
+    plus at most one insight offer that cites the exact lines it connects. Silent on the insight when
+    nothing clears the bar."""
+    today = now().strftime("%Y-%m-%d")
+    deliver_item(evening_wrap(today), "evening", "evening:" + today, replace=True)
+    found = evening_insight(today, evening_context(today))
+    if found:
+        text, ev = found
+        deliver_item("{} (from: {})".format(text, "; ".join(one_line(e, 60) for e in ev[:2])), "evening",
+                     "insight:" + today, offer=True, tags={"type": "insight"})
+    print("evening: wrap delivered{}".format("; 1 insight offered" if found else "; no insight cleared the bar"))
+    return 0
+
+
 def cmd_recall(args) -> int:
     """Never breaks the session: memory and inbox fail independently; always exit 0."""
     if getattr(args, "reindex", False):
@@ -2702,6 +2787,9 @@ def main(argv=None) -> int:
     p_brief = sub.add_parser("brief", help="what needs you right now (read-only audits)")
     p_brief.add_argument("--deliver", action="store_true", help="also put each audit's findings in the inbox")
     p_brief.set_defaults(func=cmd_brief)
+
+    p_evening = sub.add_parser("evening", help="nightly wrap for tomorrow + at most one grounded insight offer")
+    p_evening.set_defaults(func=cmd_evening)
 
     p_sweep = sub.add_parser("sweep", help="offer what's worth remembering from quiet conversations")
     p_sweep.set_defaults(func=cmd_sweep)
