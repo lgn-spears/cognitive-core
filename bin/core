@@ -1698,6 +1698,17 @@ def cmd_sweep(args) -> int:
                             "target": "{}:{}".format(target[0], target[1]) if target else None})
                 if verdict == "known":
                     continue  # memory already says this
+                grant = read_grants().get("sweep:" + it["type"])
+                if grant:
+                    deliver_item("Pre-approved (standing permission sweep:{}, their words: \"{}\"): save to memory, then "
+                                 "tell them in one line what was saved. ".format(it["type"], one_line(grant.get("words", ""), 60))
+                                 + sweep_offer_text(it, p, target).split(": ", 1)[1], "sweep", key, skip_if_acked=True,
+                                 tags={"type": it["type"], "v": SWEEP_VERSION, "granted": "1"})
+                    existing.add(key)
+                    state["offers"]["n"] += 1
+                    offered += 1
+                    _save_sweep_state(state)
+                    continue
                 deliver_item(sweep_offer_text(it, p, target), "sweep", key, skip_if_acked=True, offer=True,
                              tags={"type": it["type"], "v": SWEEP_VERSION})
                 existing.add(key)
@@ -1982,6 +1993,47 @@ def resolve_item_id(item_id, statuses=("pending",)):
     return (m[0], None) if m else (None, "no such item")
 
 
+GRANT_AFTER_YES = 3     # Muse: the 3rd yes in a category → PROPOSE a standing permission (never infer one)
+
+
+def grants_path() -> Path:
+    return home_dir() / "grants.json"
+
+
+def read_grants():
+    try:
+        g = json.loads(grants_path().read_text())
+        return g if isinstance(g, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_grants(g):
+    tmp = grants_path().with_suffix(".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(g, fh, indent=1)
+    os.replace(str(tmp), str(grants_path()))
+
+
+def maybe_propose_grant(item):
+    """After a yes: on the 3rd accepted offer of this source+type, ask ONCE whether to make it standing."""
+    t = (item.get("tags") or {}).get("type")
+    if not t or item.get("tags", {}).get("grant"):
+        return
+    scope = "{}:{}".format(item.get("source"), t)
+    if scope in read_grants():
+        return
+    yes = sum(1 for r in read_outcomes() if r.get("outcome") == "accepted" and r.get("source") == item.get("source")
+              and (r.get("tags") or {}).get("type") == t)
+    if yes < GRANT_AFTER_YES:
+        return
+    deliver_item("Standing permission? They've said yes to {} {} offers from {}. Ask whether to save these "
+                 "without asking from now on. Only their own words grant it (record them with --note); "
+                 "revoke anytime with `core grant revoke {}`.".format(yes, t, item.get("source"), scope),
+                 "theseus", "grant:" + scope, offer=True, tags={"grant": scope})
+
+
 LEARN_PAUSE_MIN = 6     # answers before a type can be paused
 LEARN_PAUSE_BELOW = 0.15
 
@@ -2050,13 +2102,44 @@ def cmd_offer(args) -> int:
             print("core offer: {}".format(err or "{} isn't an open offer".format(args.item_id)), file=sys.stderr)
             return 1
         outcome = ANSWERS[args.answer]
+        scope = (cur.get("tags") or {}).get("grant")
+        if scope and outcome == "accepted" and not (args.note or "").strip():
+            print("core offer: a standing permission needs the person's own words: "
+                  "core offer yes {} --note \"<what they said>\"".format(oid), file=sys.stderr)
+            return 2
         cur["status"] = outcome
         cur["answered_at"] = now().isoformat(timespec="seconds")
         if outcome == "deferred":
             cur["until"] = (now() + timedelta(days=OFFER_DEFER_DAYS)).isoformat(timespec="seconds")
         write_item(cur)
         log_outcome(cur, outcome, args.note or "")
+        if scope and outcome == "accepted":
+            g = read_grants()
+            g[scope] = {"granted_at": now().isoformat(timespec="seconds"), "words": args.note.strip(),
+                        "offer": oid, "revoke": "core grant revoke " + scope}
+            write_grants(g)
+    if outcome == "accepted" and not scope:
+        maybe_propose_grant(cur)
     print("{}: {}{}".format(oid, outcome, " until " + cur["until"][:10] if outcome == "deferred" else ""))
+    return 0
+
+
+def cmd_grant(args) -> int:
+    g = read_grants()
+    if args.grant_cmd == "revoke":
+        if not args.scope or args.scope not in g:
+            print("core grant: no standing permission {!r}".format(args.scope), file=sys.stderr)
+            return 1
+        del g[args.scope]
+        write_grants(g)
+        append_ledger(now(), "standing permission revoked: " + args.scope)
+        print("revoked " + args.scope)
+        return 0
+    if not g:
+        print("no standing permissions")
+    for scope, v in sorted(g.items()):
+        print('{} — granted {} in their words: "{}" (undo: {})'.format(scope, v.get("granted_at", "?")[:10],
+                                                                   v.get("words", ""), v.get("revoke", "")))
     return 0
 
 
@@ -2599,6 +2682,11 @@ def main(argv=None) -> int:
     p_offer.add_argument("item_id", nargs="?")
     p_offer.add_argument("--note", help="why (optional; becomes learning signal)")
     p_offer.set_defaults(func=cmd_offer)
+
+    p_grant = sub.add_parser("grant", help="standing permissions: list / revoke <scope>")
+    p_grant.add_argument("grant_cmd", nargs="?", choices=["list", "revoke"], default="list")
+    p_grant.add_argument("scope", nargs="?")
+    p_grant.set_defaults(func=cmd_grant)
 
     p_inbox = sub.add_parser("inbox", help="list undelivered results, or ack one")
     p_inbox.add_argument("inbox_cmd", nargs="?", choices=["list", "ack"], default="list")
