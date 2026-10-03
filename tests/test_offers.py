@@ -85,3 +85,32 @@ def test_stats_count_only_real_answers(tmp_path):
         run(tmp_path, "offer", ans, oid)
     out = run(tmp_path, "offer", "stats").stdout
     assert "1 yes" in out and "2 no" in out and "1 later" in out and "33%" in out  # later isn't a no
+
+
+def test_offers_carry_their_type_into_outcomes(tmp_path):
+    oid = run(tmp_path, "deliver", "offer text here", "--source", "sweep", "--key", "t1", "--offer", "--tag", "type=fact").stdout.strip()
+    run(tmp_path, "offer", "no", oid)
+    assert outcomes(tmp_path)[-1]["tags"] == {"type": "fact"}
+
+
+def test_learning_ranks_by_acceptance_and_pauses_a_rejected_type():
+    import importlib.machinery, importlib.util
+    l = importlib.machinery.SourceFileLoader("core", str(CORE))
+    core = importlib.util.module_from_spec(importlib.util.spec_from_loader("core", l)); l.exec_module(core)
+    rows = ([{"source": "sweep", "outcome": "declined", "tags": {"type": "correction"}}] * 6
+            + [{"source": "sweep", "outcome": "accepted", "tags": {"type": "preference"}}] * 3
+            + [{"source": "sweep", "outcome": "deferred", "tags": {"type": "fact"}}] * 5      # not answers
+            + [{"source": "sweep", "outcome": "unanswered", "tags": {"type": "fact"}}] * 5)
+    learned = core.learn_offer_types(rows)
+    assert learned["correction"]["paused"] and not learned["preference"]["paused"]
+    assert learned["preference"]["score"] > learned["fact"]["score"] > learned["correction"]["score"]
+    assert learned["fact"]["answered"] == 0  # silence and "later" teach nothing
+
+
+def test_only_the_current_extractor_version_can_pause_a_type():
+    import importlib.machinery, importlib.util
+    l = importlib.machinery.SourceFileLoader("core", str(CORE))
+    core = importlib.util.module_from_spec(importlib.util.spec_from_loader("core", l)); l.exec_module(core)
+    old = [{"outcome": "declined", "tags": {"type": "correction", "v": "old"}}] * 8
+    assert not core.learn_offer_types(old, version="new").get("correction", {}).get("paused")
+    assert core.learn_offer_types(old)["correction"]["paused"]

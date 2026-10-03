@@ -1279,6 +1279,8 @@ Answer: {{"items": [
 Conversation:
 {conversation}"""
 
+SWEEP_VERSION = hashlib.sha1(SWEEP_PROMPT.encode()).hexdigest()[:8]  # outcomes are judged per extractor version
+
 SWEEP_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {
     "type": "object", "properties": {"type": {"type": "string", "enum": list(SWEEP_TYPES)},
                                      "statement": {"type": "string"}, "quote": {"type": "string"},
@@ -1673,7 +1675,10 @@ def cmd_sweep(args) -> int:
             today = now().strftime("%Y-%m-%d")
             if state["offers"].get("date") != today:
                 state["offers"] = {"date": today, "n": 0}
-            queue = sorted(state["queue"], key=lambda q: OFFER_PRIORITY.get(q["item"].get("type"), 9))
+            learned = learn_offer_types(read_outcomes(), version=SWEEP_VERSION)
+            score = lambda t: learned.get(t, {}).get("score", 0.5)
+            queue = sorted(state["queue"], key=lambda q: (-score(q["item"].get("type")),
+                                                          OFFER_PRIORITY.get(q["item"].get("type"), 9)))
             existing = {it.get("key") for it in read_inbox()}
             judged, keep = 0, []
             for q in queue:
@@ -1685,13 +1690,16 @@ def cmd_sweep(args) -> int:
                 key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()).hexdigest()[:12]
                 if key in existing:
                     continue  # already offered (pending or answered): never twice
+                if learned.get(it["type"], {}).get("paused"):
+                    continue  # the person keeps declining this kind of offer
                 judged += 1
                 verdict, target = judge_novelty(it, related_memory(it["statement"]), model, url, api)
                 _sweep_log({"at": now().isoformat(timespec="seconds"), "judged": it["statement"], "verdict": verdict,
                             "target": "{}:{}".format(target[0], target[1]) if target else None})
                 if verdict == "known":
                     continue  # memory already says this
-                deliver_item(sweep_offer_text(it, p, target), "sweep", key, skip_if_acked=True, offer=True)
+                deliver_item(sweep_offer_text(it, p, target), "sweep", key, skip_if_acked=True, offer=True,
+                             tags={"type": it["type"], "v": SWEEP_VERSION})
                 existing.add(key)
                 state["offers"]["n"] += 1
                 offered += 1
@@ -1847,7 +1855,7 @@ def log_outcome(item, outcome, note=""):
         age = None
     rec = {"at": now().isoformat(timespec="seconds"), "id": item["id"], "key": item.get("key"),
            "source": item.get("source"), "outcome": outcome, "note": note, "shown": item.get("shown", 0),
-           "age_s": age, "text": item.get("text", "")[:300]}
+           "age_s": age, "tags": item.get("tags", {}), "text": item.get("text", "")[:300]}
     fd = os.open(str(outcomes_path()), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, "a") as fh:
         fh.write(json.dumps(rec) + "\n")
@@ -1896,7 +1904,7 @@ def render_inbox(items, limit=INBOX_SHOW):
 
 
 def deliver_item(text: str, source: str, key: str = "", replace: bool = False, skip_if_acked: bool = False,
-                 offer: bool = False) -> str:
+                 offer: bool = False, tags: dict = None) -> str:
     """Put one result in the inbox; returns its id. Same key while pending = same item
     (with replace=True its text is updated to what is true now)."""
     text, source = valid_utf8(text), valid_utf8(source)
@@ -1927,6 +1935,8 @@ def deliver_item(text: str, source: str, key: str = "", replace: bool = False, s
         }
         if offer:
             item["kind"] = "offer"
+        if tags:
+            item["tags"] = {str(k): str(v) for k, v in tags.items()}
         write_item(item)
         return item["id"]
 
@@ -1954,7 +1964,8 @@ def cmd_deliver(args) -> int:
         if same and same[0]["text"] != valid_utf8(args.text):
             print("core deliver: an item with key {!r} is still pending, so its text was kept; "
                   "add --replace to update it".format(key), file=sys.stderr)
-    print(deliver_item(args.text, args.source, key, args.replace, offer=getattr(args, "offer", False)))
+    tags = dict(t.split("=", 1) for t in getattr(args, "tag", []) if "=" in t)
+    print(deliver_item(args.text, args.source, key, args.replace, offer=getattr(args, "offer", False), tags=tags))
     return 0
 
 
@@ -1971,6 +1982,39 @@ def resolve_item_id(item_id, statuses=("pending",)):
     return (m[0], None) if m else (None, "no such item")
 
 
+LEARN_PAUSE_MIN = 6     # answers before a type can be paused
+LEARN_PAUSE_BELOW = 0.15
+
+
+def read_outcomes():
+    try:
+        return [json.loads(l) for l in open(str(outcomes_path())) if l.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def learn_offer_types(rows, version=None):
+    """Per offer type: acceptance with a neutral Beta(1,1) prior, from real answers only (yes / no /
+    never). 'Later' and unanswered teach nothing. A type answered >= LEARN_PAUSE_MIN times with a
+    score under LEARN_PAUSE_BELOW is paused: still logged, no longer offered."""
+    out = {}
+    for r in rows:
+        tags = r.get("tags") or {}
+        t = tags.get("type")
+        if not t or (version and tags.get("v") != version):
+            continue  # answers to an older extractor don't judge the current one
+        c = out.setdefault(t, {"yes": 0, "no": 0})
+        if r.get("outcome") == "accepted":
+            c["yes"] += 1
+        elif r.get("outcome") in ("declined", "never"):
+            c["no"] += 1
+    for t, c in out.items():
+        c["answered"] = c["yes"] + c["no"]
+        c["score"] = (c["yes"] + 1) / (c["answered"] + 2)
+        c["paused"] = c["answered"] >= LEARN_PAUSE_MIN and c["score"] < LEARN_PAUSE_BELOW
+    return out
+
+
 def cmd_offer(args) -> int:
     if args.answer == "stats":
         rows = []
@@ -1978,6 +2022,7 @@ def cmd_offer(args) -> int:
             rows = [json.loads(l) for l in open(str(outcomes_path()))]
         except (OSError, ValueError):
             pass
+        rows = read_outcomes()
         if not rows:
             print("no offer outcomes yet")
             return 0
@@ -1991,6 +2036,9 @@ def cmd_offer(args) -> int:
             rate = "{:.0%}".format(c.get("accepted", 0) / answered) if answered else "—"
             parts = ["{} {}".format(c[o], inv.get(o, o)) for o in ("accepted", "declined", "deferred", "never", "unanswered") if c.get(o)]
             print("{}: {} · accepted {} of yes/no/never".format(src, ", ".join(parts), rate))
+        for t, c in sorted(learn_offer_types(rows).items(), key=lambda x: -x[1]["score"]):
+            print("  {}: {} yes / {} no → score {:.2f}{}".format(t, c["yes"], c["no"], c["score"],
+                                                                " — PAUSED (keeps being declined)" if c["paused"] else ""))
         return 0
     if not args.item_id:
         print("usage: core offer yes|no|later|never <id> [--note why]", file=sys.stderr)
@@ -2543,6 +2591,7 @@ def main(argv=None) -> int:
     p_deliver.add_argument("--key", help="dedupe key; same key while pending = same item")
     p_deliver.add_argument("--replace", action="store_true", help="update the pending item's text to this one")
     p_deliver.add_argument("--offer", action="store_true", help="an offer that needs the person's answer (core offer)")
+    p_deliver.add_argument("--tag", action="append", default=[], help="key=value label kept with the outcome (e.g. type=fact)")
     p_deliver.set_defaults(func=cmd_deliver)
 
     p_offer = sub.add_parser("offer", help="record the person's answer to an offer: yes / no / later / never; or stats")
