@@ -10,7 +10,8 @@ user-owned files instead of vendor lock-in. This repo ships that periphery,
 today, for working agents.
 
 Zero dependencies. No daemon. Nothing leaves your machine — by default there is no network at all
-(the optional meaning-based recall talks to a local model server you run).
+(the optional meaning-based recall talks to a local model server you run; the optional sweep and
+evening passes send what they read to whichever model you configure for them, local or hosted).
 
 ```
                     ┌──────────────────┐
@@ -74,12 +75,18 @@ it with `core loop add "<promise>"`.
 | `core doctor` | health check: overdue loops, stale file references |
 | `core close` | silently mark activity (stop hooks) |
 | `core recall` | (UserPromptSubmit hook) cited memory lines for this message + undelivered results; `--reindex` builds the optional embedding index |
-| `core deliver "text" --source NAME [--key K]` | a background job hands a result to the inbox (same key while pending = same item) |
+| `core deliver "text" --source NAME [--key K]` | an external background job hands a result (or, with `--offer`, a question) to the inbox (same key while pending = same item); core's own names are reserved, see the deliver boundary below |
 | `core inbox` / `core inbox ack <id>` | list every undelivered result / mark one as seen (a unique part of the id is enough) |
 | `core brief [--deliver]` | run the read-only audits in `audits/` — repos with no remote, unpushed work, scheduled jobs for work that has ended; `--deliver` puts each audit's findings in the inbox (one item per audit, updated on re-run) |
 | `core deliver ... --replace` | same key while pending → update that item's text to this one (without it the pending text is kept, and it tells you) |
 | `core run NAME [--timeout S] -- CMD...` | run a background job under a lease (no overlap; if the wrapper is killed it kills the job's process group, and a still-alive orphan from a hard kill blocks the next run and keeps alarming), with a timeout that kills its whole process group, recording start/finish/status/last line in `~/.core/heartbeat.json` |
+| `core offer yes\|no\|later\|never <id> [--note why]` / `core offer stats` | record the person's answer to an offer (later = back in 3 days; never = never re-asked; an offer left unanswered for a week *after it was first shown* expires as "unanswered" — no answer, not a no — and a late answer to it is still recorded, marked late). `--note` keeps their words; it is required to accept a standing-permission proposal |
+| `core grant` / `core grant revoke <scope>` | list standing permissions (scope, date, the person's own words) / revoke one; anything already queued under it goes back to being an offer |
+| `core sweep` | offer what's worth remembering from quiet conversations (see below) |
+| `core evening` | nightly wrap for tomorrow + at most one insight offer that cites its evidence (see below; sends data to the sweep model) |
+| `core home` | the first screen, from files only (no model, works offline): what's waiting on you (numbered offers, "N waiting", and asks held for tomorrow), what was noticed (unacknowledged results), what got done today (finished jobs, overnight's morning report, your answers), and job health — a broken job moves to the top. A view: it marks nothing as shown |
 | `core heartbeat` | alarms for every pass in `~/.core/passes.conf` (`expect NAME every 1d`) that never ran, failed, timed out, was killed, has been running too long, died mid-run, or is overdue (1.5x its interval); unparseable `passes.conf` lines are alarms too; exit 1 when any |
+| `core overnight` / `core overnight resume NAME` / `core overnight ask NAME` | run the jobs in `~/.core/overnight.conf` that hold a standing permission for their exact command, in legs of ≤5 steps with a check between legs, then put one morning report in the inbox (see below); resume a job paused after 3 failing nights; ask for a job's permission again (e.g. after a no) |
 
 **Audits** are plain bash scripts listed in `audits/MANIFEST`, one finding per output line. Configure in
 `~/.core/audits.conf` (one `key value` per line, `#` comments allowed): `repo_root <dir>` (default `~/code`
@@ -149,14 +156,218 @@ since the last index, and memories under ~30 chunks, are matched by words. `tool
 scores recall against your own labeled messages — a JSON list of
 `{"prompt": "...", "expect": "recall" | "silent", "relevant": ["note_name", ...], "split": "dev"}`.
 
+**Optional: the quiet sweep** (`core sweep`) reads Claude Code conversations once they've been idle 30
+minutes and *offers* what's worth remembering — decisions, corrections, durable facts, preferences, open
+loops — through the inbox. It never writes memory itself: every offer quotes the person's own words
+(checked by code, not the model) and the agent saves it only on an explicit yes; a correction that
+contradicts an existing note is offered as "update X → Y". Configure in `~/.core/recall.conf`:
+
+```
+sweep_model qwen3:8b            # any Ollama model; or a model name with sweep_api below
+# sweep_api ollama | openai | claude   (openai = LM Studio / llama.cpp / mlx_lm server; claude = `claude -p`)
+# sweep_url http://localhost:11434
+# sweep_strict on               # block anything question-shaped (default; turn off for strong models)
+# sweep_offer_types fact preference correction   # the rest is logged only
+# asks_per_day 5               # one daily budget for EVERY ask (sweep, evening, grant proposals, deliver --offer)
+# sweep_shadow on               # log what it would offer to ~/.core/sweep.log, offer nothing
+# sweep_key_file ~/.config/x/key  # API key for a hosted OpenAI-compatible server (a file holding the key,
+                                  # or a line like `export X=key`); $SWEEP_API_KEY wins if set. Never logged.
+```
+
+Run it on a schedule under `core run sweep -- core sweep` with `expect sweep every 3h` in
+`passes.conf`. Each run is bounded (20 extractor calls, 20 minutes) and saves progress per chunk;
+before an offer, the model checks your most related memory lines so you're never offered what you
+already have. With `sweep_api claude` the extractor runs isolated: no tools, no MCP servers, no hooks,
+no saved transcript. **Where conversations go is `sweep_url`'s / the extractor's business**: a local
+model keeps them on this machine. Measured on real conversations with blind judges, extraction
+quality depends heavily on the model; test yours with `tools/eval_recall.py`-style labels before
+turning offers on (start in shadow).
+
+**Offers, answers and standing permissions.** Sweep and evening results that need a decision arrive as
+*offers*. The agent asks in one line and records the answer with `core offer yes|no|later|never <id>`;
+it never assumes one. An offer's week starts the first time it is shown, so a quiet week away never
+expires anything. After the **3rd yes** to the same kind of sweep offer (e.g. `sweep:preference`), the
+inbox asks once whether to save those without asking from now on. Only the person's own words grant it:
+`core offer yes <id> --note "<what they said>"`. A no is remembered. Proposals are only made for
+`sweep:<type>` scopes: a yes to "save these without asking" can never let an overnight job run (those are
+granted only through overnight's own offer, below). Under a grant, items arrive as "Pre-approved": the agent
+saves them and says in one line what it saved. `core grant` lists grants with the words that created
+them; `core grant revoke <scope>` ends one, and anything still queued under it — shown or still held for a
+slot — becomes an ordinary offer.
+
+**Optional: the evening pass** (`core evening`) delivers a short wrap for tomorrow (what was decided
+today, overdue loops, offers waiting, unread items, job health), retiring yesterday's wrap, plus at
+most one insight offer, and only when it cites exact lines that pass the same safety filters as quotes.
+With no `sweep_model` it only writes the wrap and says "no insight model configured". **With one, it
+sends today's ledger, your recent decisions, your open loops and the text of pending inbox items to the
+configured sweep model.** A local model keeps that on this machine; `sweep_api claude` sends it to
+Anthropic through `claude -p`, and an `openai` endpoint on another host sends it to that host. It exits
+1 when the model can't be reached (the wrap is still delivered), so the heartbeat alarms.
+
+**Scheduling sweep and evening (macOS).** Jobs started by launchd get a bare PATH, so set one that
+finds `core` and, with `sweep_api claude`, `claude`. Save as
+`~/Library/LaunchAgents/com.you.core-sweep.plist` and `launchctl bootstrap gui/$UID <file>`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.you.core-sweep</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>ProgramArguments</key><array>
+    <string>/Users/YOU/.local/bin/core</string><string>run</string><string>sweep</string><string>--</string>
+    <string>/Users/YOU/.local/bin/core</string><string>sweep</string>
+  </array>
+  <key>StartInterval</key><integer>10800</integer>
+</dict></plist>
+```
+
+For the evening pass, copy it as `com.you.core-evening`, with `evening` in place of both `sweep`
+arguments and `<key>StartCalendarInterval</key><dict><key>Hour</key><integer>21</integer></dict>` in
+place of `StartInterval`. (Run `which claude` to check its folder is on that PATH.) Then
+`printf 'expect sweep every 3h\nexpect evening every 1d\n' >> ~/.core/passes.conf`. With cron:
+
+```
+PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
+0 */3 * * * core run sweep -- core sweep
+0 21 * * *  core run evening -- core evening
+```
+
 **Heartbeats come first.** A schedule is not proof a job ran. `core inject` puts `HEARTBEAT ALARM:` lines
 right under its header, and `core brief` opens with `NOT RUNNING THAT SHOULD BE`.
 
 **Delivery rule:** an inbox item is shown at session start and on every message until it is
-acknowledged. Writing a result down is never the same as the person having seen it.
+acknowledged (offers are listed first). An unanswered offer is shown at every session start but, per
+message, only once every 10 messages, so a pending question doesn't repeat on every turn. Writing a
+result down is never the same as the person having seen it.
+
+**The deliver boundary:** `core deliver` is for external jobs' reports and offers only. It can never speak
+as one of core's own producers, so it refuses:
+
+- sources `sweep`, `evening`, `overnight`, `permissions` (compared case-blind, lookalike letters folded);
+- keys starting `grant:`, `sweep:`, `insight:`, `evening:`, `overnight:`;
+- tags `grant`, `granted`, `grant_job`, `cmd_sha`, `v` — so it can never ask for, or claim, a standing permission;
+- text claiming a pre-approval or standing permission ("Pre-approved…", "Standing permission…", "Sweep offer…").
+
+Every item records its origin (`cli` or `internal`); `--replace` and `--offer` act only on an item from the same
+origin and source, and a key already used by another producer is refused. `core offer yes` writes a grant only
+for an offer core itself made, and always says so: `standing permission granted: <scope> — revoke: core grant
+revoke <scope>`. Items from before origins existed count as `cli`.
+
+What reaches the agent's context — session start, per-message recall, `core home` — is filtered like sweep
+quotes and statements (no instructions, commands, links, secrets, hidden or lookalike characters). An item that
+fails shows as `` <source> result — open with `core inbox` ``; `core inbox`, run by you, shows the full text.
+This includes `brief --deliver` audit lines and the job output quoted under DONE TODAY.
 
 **Recall sources:** `~/.core` ledgers always; plus every `memory_dir <path>` line in
 `~/.core/recall.conf`, defaulting to each `~/.claude/projects/*/memory` directory.
+
+## Asks: one budget a day
+
+Every producer that asks you something — the sweep, the evening insight, a standing-permission proposal,
+any `core deliver --offer` — draws on one daily budget: `asks_per_day` in `~/.core/recall.conf` (default 5;
+the older `sweep_offers_per_day` still works and now covers every producer). An ask over the cap isn't
+dropped: it is kept in the inbox as *waiting*, with the reason, and takes a free slot on the next day that
+has one (oldest first, with a fresh week to answer). A held ask that finds no slot for a week dies quietly
+(`stale`; it was never asked, so it isn't counted as unanswered); a held evening insight is about one
+evening, so it is dropped quietly after a day. Plain reports are never capped.
+
+What counts: anything put to you as a question on that day — a new offer, a held ask taking its slot, an
+offer coming back from `later`, and an item turned back into an offer by `core grant revoke`. What doesn't:
+"Pre-approved" items under a standing permission (they ask nothing) and plain reports. The evening wrap says
+how many asks are waiting for tomorrow.
+
+## Home
+
+`core home` prints the first screen — the place you go on purpose:
+
+```
+Ariadne · Fri Oct 2 · 9:20 PM
+
+WAITING ON YOU · 1 waiting
+
+ 1  The overdue domain renewal and the unsent invoice are for the same client — one email
+    could do both.
+    → yes · later · no · never: core offer <answer> bbb222
+ ·  1 more ask waits for tomorrow (today's 3 are used).
+
+NOTICED
+
+ ·  2 repos have no remote: example-site, notes-app
+    audits · 8:07 AM · core inbox ack eee555
+
+DONE TODAY
+
+ ·  sweep finished 8:50 PM: "sweep: 1 offer(s) of 4 item(s)"
+ ·  You answered 3 offers today: 1 yes, 2 no.
+
+audits 8:07 AM · sweep 8:50 PM · evening 9:03 PM · all on time
+```
+
+Everything on it already lives in `~/.core` (inbox, `heartbeat.json`, `passes.conf`, `offer-outcomes.jsonl`);
+if it disappears nothing is lost. An empty home says `Nothing needs you.` A job that failed, hung or is
+overdue replaces the healthy footer with a `!` line under the header. Acknowledging an item anywhere
+removes it here.
+
+## Identity
+
+`~/.core/identity.md` (optional, yours) gives the agent a name and a voice. Its lines open every
+`core inject`, so every session on the machine is the same agent; a `name: …` line also titles `core home`.
+
+```
+name: Ariadne
+You are Ariadne, Sam's agent. Same memory in every session; the model underneath is fresh each turn.
+Blunt, warm, no lectures.
+```
+
+Without the file nothing changes.
+
+## Overnight work
+
+`core overnight` does pre-approved work while you're away and leaves one report for the morning. There are
+no jobs by default; you declare them in `~/.core/overnight.conf` (shell quoting, `#` comments):
+
+```
+deadline 4h          # whole run; each job's timeout is cut to what's left (default 4h)
+max_jobs 5           # jobs started per night; the rest wait (default 5)
+job tests scope=overnight:tests steps=1 timeout=20m cmd='cd /Users/sam/code/myapp && make test > /Users/sam/code/myapp/tests.txt'
+job notes scope=overnight:notes steps=8 check='/Users/sam/scripts/verify-notes.sh' cmd='/Users/sam/scripts/draft-note.sh $CORE_STEP'
+```
+
+Use absolute paths in `cmd` and `check`: launchd starts jobs with `/` as the working directory (and a bare
+PATH), so `./scripts/...` would resolve against `/`, not your home.
+
+- **Only with a standing permission, for that exact command.** Overnight permissions are offer-only: a job
+  runs only after you said yes, in your own words (`core offer yes <id> --note "..."`), to overnight's own
+  inbox offer for it (from `permissions`, counted against `asks_per_day`). That offer says plainly that a yes
+  permits running the job's command, names the job, its scope and a short hash of its `cmd` + `check`; the
+  command itself stays in `overnight.conf` and the log. The grant is bound to that job and that hash: edit
+  the command, or let another job claim the scope, and it is skipped and asked about again instead of run.
+  A "save these without asking" yes never grants a job, and a scope can't be a `sweep:<type>` one.
+- **Asked once; re-ask on request.** A job without a permission is skipped and asked about once per version
+  of its command. After a no it isn't asked again on its own; `core overnight ask NAME` puts the question back
+  in the inbox when you change your mind.
+- **Revoke anytime.** `core grant revoke <scope>` takes effect mid-run: the permission is re-read before every
+  step and every check, and a revoked job stops and is reported as "stopped: permission revoked" (not counted
+  as a failing night).
+- **Legs of at most 5 steps.** `cmd` runs `steps` times (`$CORE_STEP`, `$CORE_LEG`, `$CORE_JOB` are set).
+  After every 5 steps, and at the end, `check` must exit 0; without a `check`, the steps' exit status
+  decides. The first failure stops the job.
+- **Supervised like `core run`.** Each job runs as `core run overnight-NAME` (lease, process-group timeout,
+  run record), so `expect overnight-NAME every 1d` in `passes.conf` alarms when it stops running.
+- **Jobs only prepare.** Drafts, branches, local files. Sends, posts, payments, deploys, deletes and pushes
+  to shared branches are never an overnight job: they stay offers you answer in the morning. The runner
+  can't tell what a command does, so this is on you when you write `overnight.conf`.
+- **One morning report** (inbox key `overnight:<date>`): what ran, what succeeded, what failed and why, what
+  was skipped for lack of a permission. A job's own output is shown only when it passes the same filters as
+  sweep quotes (no instructions, links, commands, secrets or hidden text); otherwise the report says
+  `exit N (details in the log)`. Full output is in `~/.core/logs/overnight-<date>.log`.
+  A job that fails 3 nightly runs in a row is paused and reported until `core overnight resume NAME`.
+
+Schedule it like the audits: `core run overnight --timeout 15000 -- core overnight` at night, with
+`expect overnight every 1d` in `passes.conf`.
 
 ## Standing orders
 

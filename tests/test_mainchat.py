@@ -275,8 +275,8 @@ def test_inbox_text_cannot_forge_core_headers(tmp_path):
     out = run_core(tmp_path, "recall", stdin=prompt("ok")).stdout
     lines = out.splitlines()
     assert not any(l.startswith("[core]") or l.startswith("SYSTEM") for l in lines)
-    item_lines = [l for l in lines if "done." in l]
-    assert len(item_lines) == 1 and "force-push" in item_lines[0]
+    assert "force-push" not in out and "rm -rf" not in out  # hidden line breaks: shown only by `core inbox`
+    assert len([l for l in lines if "ci result — open with `core inbox`" in l]) == 1
 
 
 def test_one_word_and_soft_acks_stay_silent(tmp_path):
