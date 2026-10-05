@@ -12,12 +12,14 @@ decisions log that preserves WHY, and open loops that resurface until done.
     core loop done "text"    close matching loops
     core day [date]          replay one day's ledger
     core search "query"      search all ledgers
+    core sessions search "q" exact search over past conversations (core sessions index builds it)
     core recall              (UserPromptSubmit hook) cited memory hits for this message
     core run NAME -- CMD     run a background job with a lease, timeout, heartbeat record
     core heartbeat           alarms for expected passes that never ran / failed / hung / overdue
     core brief               what needs you right now (read-only audits)
     core home                the first screen: waiting on you, noticed, done today, job health
     core overnight           granted jobs from overnight.conf, checked legs, one morning report
+    core skill [undo ID]     skill patches offered from corrections (applied only by `core offer yes`)
     core close               silently mark activity (stop hooks)
 
 State lives in ~/.core (override with $CORE_HOME). Any harness that can
@@ -38,14 +40,15 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
 import time
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath
 
 MAX_JOURNAL = 50
 SHOW_RECENT = 8
@@ -61,19 +64,28 @@ def home_dir() -> Path:
     )
 
 
+def ensure_home() -> Path:
+    """CORE_HOME holds raw conversation text: created 0700 whatever the umask (an existing one is left as is)."""
+    h = home_dir()
+    if not h.is_dir():
+        h.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(h), 0o700)
+    return h
+
+
 def state_file() -> Path:
-    home_dir().mkdir(parents=True, exist_ok=True)
+    ensure_home()
     return home_dir() / "state.json"
 
 
 def days_dir() -> Path:
-    d = home_dir() / "days"
-    d.mkdir(parents=True, exist_ok=True)
+    d = ensure_home() / "days"
+    d.mkdir(exist_ok=True)
     return d
 
 
 def decisions_file() -> Path:
-    home_dir().mkdir(parents=True, exist_ok=True)
+    ensure_home()
     f = home_dir() / "decisions.log"
     if not f.exists():  # touch() on an existing file bumps its mtime (and would look like an edit)
         f.touch()
@@ -81,7 +93,7 @@ def decisions_file() -> Path:
 
 
 def loops_file() -> Path:
-    home_dir().mkdir(parents=True, exist_ok=True)
+    ensure_home()
     f = home_dir() / "loops.md"
     if not f.exists():  # touch() on an existing file bumps its mtime (and would look like an edit)
         f.touch()
@@ -784,7 +796,7 @@ def write_index(model, chunks, vecs, files_done):
     flat = array.array("f")
     for v in vecs:
         flat.extend(v)
-    home_dir().mkdir(parents=True, exist_ok=True)
+    ensure_home()
     vecfile = "recall-index-{}.f32".format(os.urandom(4).hex())
     fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".recall-vec-")
     with os.fdopen(fd, "wb") as fh:
@@ -900,8 +912,8 @@ def refresh_index_in_background() -> None:
     try:
         if not index_is_stale():
             return
-        log = home_dir() / "logs"
-        log.mkdir(parents=True, exist_ok=True)
+        log = ensure_home() / "logs"
+        log.mkdir(exist_ok=True)
         with open(str(log / "recall-index.log"), "a") as out:
             subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "recall", "--reindex"],
                              stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -1022,10 +1034,18 @@ def transcript_turns(path: Path):
     """[(line_no, 'user'|'assistant', text)] from a Claude Code transcript: the person's own messages
     and the assistant's visible replies. Tool calls/results, hidden reasoning, hook and system
     injections, and subagent traffic are dropped; consecutive assistant texts merge into one reply."""
+    return [t[:3] for t in transcript_turns_timed(path)]
+
+
+def transcript_turns_timed(path: Path, strict: bool = False):
+    """transcript_turns with each turn's timestamp as a 4th field ('' when the transcript has none).
+    strict: an unreadable file raises OSError instead of reading as empty."""
     turns = []
     try:
         fh = open(str(path), errors="replace")
     except OSError:
+        if strict:
+            raise
         return turns
     with fh:
         for n, raw in enumerate(fh, 1):
@@ -1047,9 +1067,10 @@ def transcript_turns(path: Path):
             if role == "user" and (INJECTED_RE.match(text) or NOT_FROM_PERSON_RE.search(text[:400])):
                 continue
             if role == "assistant" and turns and turns[-1][1] == "assistant":
-                turns[-1] = (turns[-1][0], "assistant", turns[-1][2] + "\n" + text)
+                turns[-1] = turns[-1][:2] + (turns[-1][2] + "\n" + text,) + turns[-1][3:]
                 continue
-            turns.append((n, role, text))
+            ts = d.get("timestamp")
+            turns.append((n, role, text, ts if isinstance(ts, str) else ""))
     return turns
 
 
@@ -1130,8 +1151,8 @@ INSTRUCTION_RE = re.compile(
 
 
 SECRETS_RE = re.compile(r"\b(passwords?|passphrases?|(access|auth|bearer|refresh|session) tokens?|"
-                        r"secrets?|credentials?|private keys?|"
-                        r"dot com|dot net|dot io|at sign)\b", re.I)
+                        r"secrets?|credentials?|private keys?|api[ _-]?keys?|"
+                        r"dot com|dot net|dot io|dot org|dot dev|dot ai|at sign)\b", re.I)
 CONFUSABLES = str.maketrans("аеорсухіјѕԁԛѵԝАВЕКМНОРСТХІЈЅοερτυχνΟΕΡΤΥΧΝΑΒΚΜΙ·", "aeopcyxijsdqvwABEKMHOPCTXIJSoeptuxvOEPTYXNABKMI.")
 APPROVAL_WORDS = {"yes", "yeah", "yep", "ok", "okay", "sure", "go", "ahead", "do", "it", "that", "this", "with",
                   "please", "sounds", "good", "great", "lets", "let", "s", "ship", "send", "fine", "cool", "perfect",
@@ -1481,14 +1502,43 @@ def sweep_state_path() -> Path:
     return home_dir() / "sweep-state.json"
 
 
-def sweep_sources():
+def sweep_sources(headless=None):
+    """Transcripts the sweep reads. Headless runs (`claude -p` / the SDK: entrypoint sdk-*) are left out unless
+    `sweep_headless on`: their "user" turns are an agent's brief, not the person. headless=True: all of them."""
+    if headless is None:
+        headless = (recall_conf_values("sweep_headless") or ["off"])[-1].lower() in ("on", "yes", "true", "1")
     dirs = [Path(os.path.expanduser(d)) for d in recall_conf_values("sweep_dir")] or \
         [Path.home() / ".claude" / "projects"]
     out = []
     for d in dirs:
         out.extend(p for p in d.glob("*/*.jsonl") if p.is_file())
         out.extend(p for p in d.glob("*.jsonl") if p.is_file())
-    return out
+    return out if headless else [p for p in out if not is_headless(transcript_entrypoint(p))]
+
+
+def transcript_entrypoint(path: Path) -> str:
+    """How the session was started ('cli', 'sdk-cli', ...), from the first record that says; '' if none does.
+    Stops at the first conversation turn, so only the head of the file is read."""
+    try:
+        with open(str(path), errors="replace") as fh:
+            for raw in fh:
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                if isinstance(d.get("entrypoint"), str):
+                    return d["entrypoint"]
+                if d.get("type") in ("user", "assistant"):
+                    return ""
+    except OSError:
+        pass
+    return ""
+
+
+def is_headless(entrypoint: str) -> bool:
+    return entrypoint.startswith("sdk")
 
 
 def chunk_turns(turns, limit=SWEEP_CHUNK_CHARS):
@@ -1608,6 +1658,18 @@ def _last_line(path: Path) -> int:
 
 
 def cmd_sweep(args) -> int:
+    """A cheap incremental refresh of the session search index, then the sweep. The refresh runs first so any
+    warning it prints comes before the sweep's summary (the run record's last line); it never changes the
+    sweep's exit status."""
+    try:
+        sessions_index()
+    except Exception as e:
+        print("sessions index not refreshed: {}".format(one_line(str(e), 200)), file=sys.stderr, flush=True)
+    sys.stdout.flush()
+    return sweep_pass()
+
+
+def sweep_pass() -> int:
     """Read conversations that have gone quiet, extract what's worth remembering, and OFFER it via the
     inbox. Never writes memory itself. Bounded per run (chunks, deadline); progress is saved per chunk.
     Exit 1 when a chunk failed (the heartbeat alarms); it is retried, and skipped after SWEEP_MAX_TRIES."""
@@ -1660,6 +1722,8 @@ def cmd_sweep(args) -> int:
                 rec["size"] = size
                 continue
             finished = True
+            # skill-patch evidence is the person's own words: a headless run's "user" turns are an agent's brief
+            loads = [] if is_headless(transcript_entrypoint(p)) else skill_loads(p)
             for chunk in chunk_turns(turns):
                 if calls >= max_chunks or time.monotonic() - start > SWEEP_DEADLINE:
                     finished = False
@@ -1694,13 +1758,19 @@ def cmd_sweep(args) -> int:
                             "shadow": shadow, "from_line": chunk[0][0], "to_line": chunk[-1][0],
                             "items": items, "raw": raw, "traps": traps})
                 kept_total += len(items)
-                if not shadow:  # shadow mode never builds a backlog that floods in later
-                    state["queue"].extend({"item": it, "path": str(p)} for it in items if it["type"] in offer_types)
+                for it in items:  # a correction made while a skill was in use: a skill-patch candidate
+                    sk = skill_at(loads, it["line"]) if it["type"] == "correction" else None
+                    if sk:
+                        rec.setdefault("skill_hits", []).append([sk["skill_md"], sk["line"], it["line"]])
+                    if not shadow and (it["type"] in offer_types or sk):  # shadow never builds a backlog
+                        state["queue"].append(dict({"item": it, "path": str(p)}, **({"skill": sk} if sk else {})))
                 rec["line"] = chunk[-1][0]
                 rec.get("fails", {}).pop(key, None)
                 _save_sweep_state(state)
             if finished:
                 rec["size"] = size
+                if loads:
+                    record_skill_next_use(loads, rec.get("skill_hits", []))
             _save_sweep_state(state)
         if first_run and not sweep_state_path().exists():
             _save_sweep_state(state)
@@ -1711,10 +1781,15 @@ def cmd_sweep(args) -> int:
             score = lambda t: learned.get(t, {}).get("score", 0.5)
             queue = sorted(state["queue"], key=lambda q: (-score(q["item"].get("type")),
                                                           OFFER_PRIORITY.get(q["item"].get("type"), 9)))
+            skill_offer_pass(state, model, url, api, start, offer_types)  # one open at a time, before memory offers
+            queue = [q for q in queue if any(q is x for x in state["queue"])]
             existing = {it.get("key") for it in read_inbox()}
             judged, keep = 0, []
             for q in queue:
                 it, p = q["item"], Path(q["path"])
+                if q.get("skill"):
+                    keep.append(q)  # its home is a skill patch, which waits until no skill offer is open
+                    continue
                 if judged >= SWEEP_MAX_JUDGE or time.monotonic() - start > SWEEP_DEADLINE:
                     keep.append(q)  # waits for the next run
                     continue
@@ -1756,6 +1831,969 @@ def cmd_sweep(args) -> int:
         return 1 if failed else 0
 
 
+# ---- session search: exact, model-free search over past conversations (raw words, cited, never summarized) ----
+SESSIONS_SCHEMA = 3  # 2: entrypoint + headless flag; 3: also skill loads (rebuilt only by `core sessions index`)
+SESSIONS_LIMIT = 10
+SESSIONS_SNIPPET = 240
+SESSIONS_BOOKEND = 160
+SESSIONS_BUSY_SECONDS = 10    # wait this long for a writer before giving up (WAL: readers rarely wait at all)
+SESSIONS_OPTIMIZE_AFTER = 50  # after re-reading this many transcripts, merge the FTS5 segments into one
+SESSIONS_REBUILD = "index needs rebuild: run `core sessions index`"
+
+
+class SessionsIndexStale(Exception):
+    """The index was built by another version or search mode; only `core sessions index` rebuilds it."""
+
+
+def sessions_db_path() -> Path:
+    return home_dir() / "sessions.db"
+
+
+def fts5_available() -> bool:
+    try:
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+        finally:
+            con.close()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _cores_own_prompt(text: str) -> bool:
+    """core's own model calls (sweep, novelty judge, evening insight) if they ever left a transcript."""
+    for prompt in (SWEEP_PROMPT, JUDGE_PROMPT, INSIGHT_PROMPT, SKILL_PATCH_PROMPT):
+        head = prompt.split("{", 1)[0][:60]
+        if head and text.startswith(head):
+            return True
+    return False
+
+
+def _sessions_connect():
+    con = sqlite3.connect(str(sessions_db_path()), timeout=SESSIONS_BUSY_SECONDS)
+    con.execute("PRAGMA busy_timeout = {}".format(SESSIONS_BUSY_SECONDS * 1000))
+    return con
+
+
+def _sessions_mode() -> str:
+    return "fts5" if fts5_available() else "like"
+
+
+def _sessions_meta(con) -> dict:
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone():
+        return {}
+    return dict(con.execute("SELECT k, v FROM meta"))
+
+
+def _sessions_reader():
+    """(con, mode) for searching. Never writes: an index built another way raises SessionsIndexStale."""
+    con = _sessions_connect()
+    try:
+        mode = _sessions_mode()
+        if _sessions_meta(con) != {"schema": str(SESSIONS_SCHEMA), "mode": mode}:
+            raise SessionsIndexStale(SESSIONS_REBUILD)
+    except BaseException:
+        con.close()
+        raise
+    return con, mode
+
+
+SESSIONS_DDL = [
+    "DROP TABLE IF EXISTS msgs_fts", "DROP TABLE IF EXISTS msgs", "DROP TABLE IF EXISTS files",
+    "DROP TABLE IF EXISTS loads", "DROP TABLE IF EXISTS meta",
+    "CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)",
+    """CREATE TABLE files (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, skipped INTEGER DEFAULT 0,
+                           entrypoint TEXT DEFAULT '', first_user TEXT, last_user TEXT)""",
+    """CREATE TABLE msgs (id INTEGER PRIMARY KEY, path TEXT, line INTEGER, role TEXT, ts TEXT, text TEXT,
+                          headless INTEGER DEFAULT 0)""",
+    "CREATE INDEX msgs_path ON msgs(path)",
+    "CREATE INDEX msgs_ts ON msgs(ts)",
+    "CREATE TABLE loads (path TEXT, line INTEGER, name TEXT, skill_md TEXT, ts TEXT)",
+    "CREATE INDEX loads_path ON loads(path)",
+]
+SESSIONS_FTS_DDL = [
+    "CREATE VIRTUAL TABLE msgs_fts USING fts5(text, content='msgs', content_rowid='id')",
+    """CREATE TRIGGER msgs_ai AFTER INSERT ON msgs BEGIN
+         INSERT INTO msgs_fts(rowid, text) VALUES (new.id, new.text); END""",
+    """CREATE TRIGGER msgs_ad AFTER DELETE ON msgs BEGIN
+         INSERT INTO msgs_fts(msgs_fts, rowid, text) VALUES ('delete', old.id, old.text); END""",
+]
+
+
+def _sessions_writer():
+    """(con, mode) for indexing; callers hold sessions.lock. Private (0600) from its first byte, WAL. Returns
+    inside one write transaction (rebuilt first when its schema or search mode doesn't match): the caller commits
+    once, at the end, so a search during a refresh reads the whole previous index, and an interrupted refresh
+    rolls back to it."""
+    path = sessions_db_path()
+    ensure_home()
+    os.close(os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600))
+    os.chmod(str(path), 0o600)
+    con = _sessions_connect()
+    con.isolation_level = None  # transactions are explicit
+    try:
+        con.execute("PRAGMA journal_mode = WAL")
+        mode = _sessions_mode()
+        con.execute("BEGIN IMMEDIATE")
+        if _sessions_meta(con) != {"schema": str(SESSIONS_SCHEMA), "mode": mode}:
+            for stmt in SESSIONS_DDL + (SESSIONS_FTS_DDL if mode == "fts5" else []):
+                con.execute(stmt)
+            con.executemany("INSERT INTO meta VALUES (?, ?)", [("schema", str(SESSIONS_SCHEMA)), ("mode", mode)])
+    except BaseException:
+        con.close()  # closing rolls back
+        raise
+    return con, mode
+
+
+def _iso_utc(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _utc_stamp(ts: str, fallback: str) -> str:
+    """One format for every stored timestamp (UTC, ...Z), so --since compares like with like."""
+    try:
+        d = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return fallback
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _since_utc(day: str) -> str:
+    """Local midnight starting YYYY-MM-DD, as a UTC stamp. ValueError if it isn't a real date."""
+    local = datetime.strptime(day, "%Y-%m-%d").astimezone()
+    return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def sessions_index(quiet: bool = False) -> dict:
+    """Bring the index up to date with sweep_sources(headless=True): re-read new or changed transcripts (by size
+    and mtime), drop deleted ones. Headless runs are indexed (hidden from search by default) with their "user"
+    turns labelled `agent`. The whole refresh is one transaction (see _sessions_writer): searches meanwhile see
+    the previous index, and an interrupted run changes nothing. A file that can't be read gets no files row, so
+    it's tried again next run."""
+    stats = {"files": 0, "changed": 0, "removed": 0, "busy": False}
+    with file_lock(home_dir() / "sessions.lock", blocking=False) as got:
+        if not got:
+            stats["busy"] = True
+            return stats
+        con, mode = _sessions_writer()
+        try:
+            known = {p: (size, mtime) for p, size, mtime in con.execute("SELECT path, size, mtime FROM files")}
+            seen = set()
+            for p in sweep_sources(headless=True):
+                if p.name.startswith("agent-"):
+                    continue  # pre-2.0 subagent transcripts sat beside the sessions
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                key = str(p)
+                seen.add(key)
+                if known.get(key) == (st.st_size, st.st_mtime):
+                    continue
+                try:
+                    turns = transcript_turns_timed(p, strict=True)
+                except OSError:
+                    continue  # unreadable now: whatever was indexed before stays, and it's retried next run
+                entry = transcript_entrypoint(p)
+                headless = is_headless(entry)
+                said = [t for t in turns if t[1] == "user"]
+                skipped = not said or _cores_own_prompt(said[0][2])
+                fallback = _iso_utc(st.st_mtime)
+                con.execute("DELETE FROM msgs WHERE path = ?", (key,))
+                con.execute("DELETE FROM loads WHERE path = ?", (key,))
+                if not skipped:
+                    con.executemany(
+                        "INSERT INTO msgs (path, line, role, ts, text, headless) VALUES (?, ?, ?, ?, ?, ?)",
+                        [(key, n, "agent" if headless and role == "user" else role,
+                          _utc_stamp(ts, fallback), text, int(headless)) for n, role, text, ts in turns])
+                    con.executemany("INSERT INTO loads VALUES (?, ?, ?, ?, ?)",
+                                    [(key, l["line"], l["name"], l["skill_md"], l["ts"]) for l in skill_loads(p)])
+                con.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (key, st.st_size, st.st_mtime, int(skipped), entry,
+                             said[0][2][:2000] if said else "", said[-1][2][:2000] if said else ""))
+                stats["changed"] += 1
+            for key in set(known) - seen:
+                con.execute("DELETE FROM msgs WHERE path = ?", (key,))
+                con.execute("DELETE FROM loads WHERE path = ?", (key,))
+                con.execute("DELETE FROM files WHERE path = ?", (key,))
+                stats["removed"] += 1
+            if mode == "fts5" and stats["changed"] >= SESSIONS_OPTIMIZE_AFTER:
+                # many re-read transcripts leave many FTS5 segments: merge them so searches stay fast
+                con.execute("INSERT INTO msgs_fts(msgs_fts) VALUES ('optimize')")
+            con.execute("COMMIT")
+            stats["files"] = con.execute("SELECT COUNT(*) FROM files WHERE skipped = 0").fetchone()[0]
+            stats["messages"] = con.execute("SELECT COUNT(*) FROM msgs").fetchone()[0]
+        finally:
+            con.close()
+    return stats
+
+
+def sessions_load_rows(rows) -> None:
+    """Bulk-load (path, line, role, ts, text) rows (benchmarks and tests)."""
+    con, _ = _sessions_writer()
+    con.executemany("INSERT INTO msgs (path, line, role, ts, text) VALUES (?, ?, ?, ?, ?)", rows)
+    con.execute("COMMIT")
+    con.close()
+
+
+def _query_terms(query: str):
+    """Search terms; all must match. "quoted words" stay one phrase; anything else is one term per word."""
+    terms = []
+    for phrase, word in re.findall(r'"([^"]*)"?|(\S+)', query):
+        terms.extend([" ".join(phrase.split())] if phrase.strip() else re.findall(r"\w+", word))
+    return [t for t in terms if re.search(r"\w", t)]
+
+
+def sessions_search(query, role=None, project=None, since=None, limit=SESSIONS_LIMIT, headless=False):
+    """Matching messages, newest first: [{path, line, role, ts, text, terms, first_user, last_user, entrypoint}].
+    Exact words, no model, read-only. since: YYYY-MM-DD, local midnight. headless: include agent-driven runs."""
+    terms = _query_terms(query)
+    if not terms or not sessions_db_path().exists():
+        return []
+    con, mode = _sessions_reader()
+    try:
+        where, params = [], []
+        if mode == "fts5":  # every term quoted: FTS5 operators and syntax in the query are just words
+            fts = ['"' + " ".join(re.findall(r"\w+", t)) + '"' for t in terms]
+            where.append("id IN (SELECT rowid FROM msgs_fts WHERE msgs_fts MATCH ?)")
+            params.append(" ".join(fts))
+        else:  # no FTS5 in this sqlite: LIKE narrows, then whole-word/phrase matching decides (as FTS5 would)
+            for t in terms:
+                where.append("text LIKE ? ESCAPE '\\'")
+                params.append("%" + re.sub(r"([\\%_])", r"\\\1", t) + "%")
+            con.create_function("core_terms", 1, lambda text: all(_term_match(t, text or "") for t in terms))
+            where.append("core_terms(text)")
+        if not headless:
+            where.append("headless = 0")
+        if role:
+            where.append("role = ?")
+            params.append(role)
+        if project:
+            con.create_function("core_project", 1, lambda path: Path(path).parent.name.lower())
+            where.append("instr(core_project(path), ?) > 0")
+            params.append(project.lower())
+        if since:
+            where.append("ts >= ?")
+            params.append(_since_utc(since))
+        sql = ("SELECT path, line, role, ts, text FROM msgs WHERE " + " AND ".join(where) +
+               " ORDER BY ts DESC, path, line DESC LIMIT ?")
+        rows = con.execute(sql, params + [int(limit)]).fetchall()
+        hits = [{"path": p, "line": n, "role": r, "ts": ts, "text": text, "terms": terms}
+                for p, n, r, ts, text in rows]
+        for h in hits:
+            row = con.execute("SELECT first_user, last_user, entrypoint FROM files WHERE path = ?",
+                              (h["path"],)).fetchone()
+            h["first_user"], h["last_user"], h["entrypoint"] = row if row else ("", "", "")
+        return hits
+    finally:
+        con.close()
+
+
+def _term_match(term: str, text: str):
+    """Where a word or phrase occurs as whole words (case-blind), or None."""
+    words = re.findall(r"\w+", term)
+    if not words:
+        return None
+    return re.search(r"(?<!\w)" + r"\W+".join(re.escape(w) for w in words) + r"(?!\w)", text, re.I)
+
+
+def _snippet(text: str, terms, width: int = SESSIONS_SNIPPET) -> str:
+    found = [m.start() for m in (_term_match(t, text) for t in terms) if m]
+    start = max(0, min(found, default=0) - width // 3)
+    piece = text[start:start + width]
+    return ("…" if start else "") + one_line(piece, width) + ("…" if start + width < len(text) else "")
+
+
+def _local_time(ts: str) -> str:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ts[:16]
+
+
+def positive_int(v: str) -> int:
+    try:
+        n = int(v)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be a whole number, 1 or more")
+    return n
+
+
+def _sessions_unreachable(write: bool):
+    """The index file (or its WAL/shm companion) this command can't open, or None."""
+    db = sessions_db_path()
+    for f in (db, Path(str(db) + "-wal"), Path(str(db) + "-shm")):
+        if f.exists() and not os.access(str(f), os.R_OK | (os.W_OK if write else 0)):
+            return f
+    return None
+
+
+def cmd_sessions(args) -> int:
+    bad = _sessions_unreachable(args.sessions_cmd == "index")
+    try:
+        if not bad:
+            return _cmd_sessions(args)
+    except PermissionError as e:
+        bad = Path(e.filename or sessions_db_path())
+    except sqlite3.DatabaseError as e:  # busy past the timeout, or a damaged file: one line, never a traceback
+        print("core sessions {}: couldn't read the index ({}); try again, or delete {} and run "
+              "`core sessions index`".format(args.sessions_cmd, one_line(str(e), 120),
+                                            display_path(sessions_db_path())), file=sys.stderr)
+        return 1
+    print("core sessions {}: no permission to {} {} (the index should be yours, mode 0600: chmod 600 it)".format(
+        args.sessions_cmd, "write" if args.sessions_cmd == "index" else "read", display_path(bad)), file=sys.stderr)
+    return 1
+
+
+def _cmd_sessions(args) -> int:
+    if args.sessions_cmd == "index":
+        t0 = time.monotonic()
+        s = sessions_index()
+        if s["busy"]:
+            print("sessions index: already being refreshed")
+            return 0
+        size = sessions_db_path().stat().st_size / 1e6
+        print("indexed {} transcript(s) ({} new or changed, {} removed): {} messages, {:.1f} MB, {:.1f}s".format(
+            s["files"], s["changed"], s["removed"], s["messages"], size, time.monotonic() - t0))
+        return 0
+    if not args.query:
+        print('usage: core sessions search "<query>" [--role user|assistant|agent] [--project X] '
+              '[--since YYYY-MM-DD] [--headless]', file=sys.stderr)
+        return 2
+    if args.since:
+        try:
+            _since_utc(args.since)
+        except ValueError:
+            print("--since takes a real date, YYYY-MM-DD", file=sys.stderr)
+            return 2
+    if not sessions_db_path().exists():
+        print("no session index yet: run `core sessions index` (core sweep also refreshes it)")
+        return 0
+    try:
+        hits = sessions_search(args.query, role=args.role, project=args.project, since=args.since,
+                               limit=args.limit, headless=args.headless)
+    except SessionsIndexStale as e:
+        with file_lock(home_dir() / "sessions.lock", blocking=False) as free:
+            pass
+        print(str(e) if free else "the session index is being rebuilt right now (`core sessions index` is running); "
+              "search again when it finishes", file=sys.stderr)
+        return 2
+    if not hits:
+        print("no matches for {!r}".format(args.query))
+        return 0
+    order = []
+    for h in hits:
+        if h["path"] not in order:
+            order.append(h["path"])
+    for path in order:
+        mine = [h for h in hits if h["path"] == path]
+        p = Path(path)
+        agent = is_headless(mine[0]["entrypoint"] or "")
+        print("== {} · {}{} ==".format(p.parent.name, p.stem, " (headless: an agent's run)" if agent else ""))
+        if mine[0]["first_user"]:  # a headless run's "user" is the agent that drove it, not the person
+            who = "agent " if agent else ""
+            print("   {}began: {}".format(who, one_line(mine[0]["first_user"], SESSIONS_BOOKEND)))
+            if mine[0]["last_user"] != mine[0]["first_user"]:
+                print("   {}ended: {}".format(who, one_line(mine[0]["last_user"], SESSIONS_BOOKEND)))
+        for h in mine:
+            print("  {}:{}  {}  {}".format(display_path(p), h["line"], h["role"], _local_time(h["ts"])))
+            print("    " + _snippet(h["text"], h["terms"]))
+        print()
+    more = " (newest {}; --limit for more)".format(len(hits)) if len(hits) >= args.limit else ""
+    print("{} message(s) in {} session(s){}".format(len(hits), len(order), more))
+    return 0
+
+
+# ---- skill-patch offers: a correction made while a skill was in use → a reviewable patch to that SKILL.md ----
+# The trigger is evidence, never effort: a skill was loaded in the conversation AND the person's correction (a
+# sweep item that passed the quote gate: verbatim, not tentative) landed in that skill's span. A model drafts a
+# minimal diff; code decides whether it may become an offer. Nothing writes a skill except `core offer yes` on
+# core's own offer, which re-checks the file's hash and keeps a rollback copy.
+SKILL_PATCH_MAX_LINES = 12      # changed lines (+ and -) in one patch: a rule, not a rewrite
+SKILL_PATCH_MAX_REMOVED = 1     # a patch adds or rewords a rule; it never strips the skill
+SKILL_OFFER_LINES_CHARS = 160   # the changed lines shown in the offer itself (each line cut to fit)
+SKILL_NAME_RE = re.compile(r"^[\w.-]+$")
+SKILL_FILE_MAX = 60000          # bigger skill files aren't sent to the drafter
+SKILL_DRAFTS_PER_RUN = 3        # drafter calls per sweep run; the first acceptable patch ends the search
+SKILL_PRIOR_MAX = 2             # earlier corrections of the same skill cited as evidence
+SKILL_BASE_RE = re.compile(r"^Base directory for this skill:\s*(\S[^\n]*?)\s*$", re.M)
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
+PATCH_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+# Hermes's do-not-capture rule, in code: a negative claim about a tool hardens into a refusal the agent cites
+# against itself for months.
+NEGATIVE_TOOL_RE = re.compile(r"\b(is|are|was|were|seems?|looks?) (broken|buggy|flaky|unreliable|unusable)\b|"
+                              r"\b(doesn'?t|does not|don'?t|do not|won'?t|will not|never) work(s|ing)?\b", re.I)
+
+SKILL_PATCH_PROMPT = """You maintain a skill file: instructions a coding assistant loads for one kind of task. While this
+skill was in use, the person corrected the assistant. Propose the smallest change to the file that would have
+prevented the correction, as a unified diff, or propose nothing.
+
+What goes in:
+- The durable rule, plus at most one short clause of why, placed at the step it affects.
+- Fix the skill in place. Never append "UPDATE:" notes or a change log.
+- The same lesson said twice is ONE rule.
+- No dates, session details, quoted chat, or names of one-off files.
+- Keep it short: at most {max_lines} changed lines. Do not restate, reorder or rewrite the rest of the skill.
+- Plain prose only: no code, commands, links or backticks. Never change the frontmatter name.
+
+Never capture:
+- negative claims about tools ("X is broken", "X doesn't work"): they harden into refusals;
+- failures that depend on one machine or environment, or transient errors;
+- one-off narratives about this particular task;
+- failed or unresolved attempts presented as best practice.
+If the correction is not about how this skill's task should be done, or would break these rules, answer
+{{"diff": null, "summary": ""}}.
+
+Skill: {name}
+File (current contents, between the markers):
+<<<FILE
+{content}
+FILE>>>
+
+What the person said (verbatim): "{quote}"
+What it means: {statement}
+{prior}
+Reply with only a JSON object: {{"diff": "<unified diff of the file above: @@ hunks with 3 lines of context>" or null,
+"summary": "<one plain sentence: what the patch changes>"}}"""
+
+# A skill's text is loaded as instructions every time it runs, so a patch line (added or removed) passes more than
+# the quote/statement filters: no markup or comments, no links (bare, spelled-out or defanged domains), no
+# credential handling, no unconfirmed or destructive steps, nothing that says to set earlier guidance aside.
+_TLDS = r"(com|org|net|io|dev|ai|co|app|sh|me|info|biz|xyz|gg|ly|tv|us|uk|de|ru|cn|site|online|link|zip|mov)"
+SKILL_LINE_RE = re.compile(
+    r"<|\]\(|\[\.\]|\(\.\)|\[dot\]|\(dot\)|\b[\w-]+\." + _TLDS + r"\b|\bdot " + _TLDS + r"\b|\b\w+ dot \w+ dot \w+|"
+    r"\bapi[ _-]?keys?\b|(?<![\w.])\.env\b|\benv(ironment)? files?\b|\bid_rsa\b|\.ssh\b|\.aws\b|\bkeychain\b|"
+    r"\bwithout (asking|confirm\w*|checking|approval|permission|review\w*)\b|\bno confirmation\b|\bauto[- ]?approv\w*|"
+    r"\bforce[- ]?push\w*|--force\b|\bpush\s+-f\b|\breset\s+(--)?hard\b|\bgit\s+(clean|reset|rebase|filter-branch)\b|"
+    r"\bpush\w*\b[^.]{0,40}\b(main|master|prod\w*)\b|\bdelete\s+(the\s+)?(repo\w*|branch\w*|history)\b|"
+    r"\b(disregard|ignore|forget|override)\b[^.]{0,40}\b(earlier|previous|prior|above|preceding|guidance|instructions?|"
+    r"rules?|steps?|guidelines?)\b|\bskip\w*\s+(all\s+|the\s+|any\s+)?(tests?|reviews?|checks?|verification|confirmation)\b",
+    re.I)
+SKILL_SAFETY_RE = re.compile(r"\b(confirm\w*|ask\w*|never|don'?t|do not|must not|verif\w*)\b", re.I)
+
+SKILL_PATCH_SCHEMA = {"type": "object", "properties": {"diff": {"type": ["string", "null"]},
+                                                       "summary": {"type": "string"}},
+                      "required": ["diff", "summary"]}
+SKILL_OFFER_HEAD = "Skill patch offer (only on an explicit yes): "
+
+
+def skill_loads(path: Path):
+    """[{line, name, skill_md, ts}] for every skill loaded in a transcript, in order. Claude Code injects
+    'Base directory for this skill: DIR' (a meta message) after the Skill tool's call and after a /slash-command
+    load; that names the file. A Skill call with no injection falls back to ~/.claude/skills/<name>/SKILL.md."""
+    calls, loads = {}, []
+    try:
+        fh = open(str(path), errors="replace")
+    except OSError:
+        return loads
+    with fh:
+        for n, raw in enumerate(fh, 1):
+            if '"Skill"' not in raw and "Base directory for this skill" not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or d.get("isSidechain"):
+                continue
+            msg = d.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            ts = d.get("timestamp") if isinstance(d.get("timestamp"), str) else ""
+            if d.get("type") == "assistant" and isinstance(content, list):
+                for b in content:
+                    name = (b.get("input") or {}).get("skill") if isinstance(b, dict) and b.get("type") == "tool_use" \
+                        and b.get("name") == "Skill" and isinstance(b.get("input"), dict) else None
+                    if isinstance(name, str) and name.strip():
+                        calls[str(b.get("id") or n)] = {"line": n, "name": name.strip(), "ts": ts}
+            elif d.get("type") == "user" and d.get("isMeta"):  # the person can't type a meta message
+                m = SKILL_BASE_RE.search(_message_text(content)[:4000])
+                if not m:
+                    continue
+                base = Path(m.group(1))
+                call = calls.pop(str(d.get("sourceToolUseID") or ""), None)
+                if call is None:  # no id to match: the latest call for this skill is the same load
+                    for k in [k for k, c in calls.items() if c["name"] in (base.name, base.name.split(":")[-1])][-1:]:
+                        call = calls.pop(k)
+                loads.append({"line": n, "name": call["name"] if call else base.name,
+                              "skill_md": str(base / "SKILL.md"), "ts": ts})
+    for c in calls.values():
+        md = Path.home() / ".claude" / "skills" / c["name"] / "SKILL.md"
+        if SKILL_NAME_RE.match(c["name"]) and c["name"] not in (".", "..") and md.is_file():
+            loads.append({"line": c["line"], "name": c["name"], "skill_md": str(md), "ts": c["ts"]})
+    return sorted(loads, key=lambda l: l["line"])
+
+
+def skill_at(loads, line):
+    """The skill whose span a line falls in: the most recent load before it (a later load ends the span)."""
+    before = [l for l in loads if l["line"] < line]
+    return before[-1] if before else None
+
+
+def skill_patchable(skill_md):
+    """(resolved path, '') for a skill file core may offer to patch, else (None, why). Symlinks are followed so a
+    write lands in the real file. Plugin-managed skills are refused: an update would overwrite the patch."""
+    raw = os.path.expanduser(str(skill_md))
+    real = Path(os.path.realpath(raw))
+    if "/.claude/plugins/" in str(real) + "/" or "/.claude/plugins/" in str(skill_md):
+        return None, "plugin-managed skill (an update would overwrite a patch)"
+    lex = Path(os.path.normpath(os.path.abspath(raw)))  # where it claims to be, before any symlink is followed
+    name = lex.parent.name
+    if (".." in Path(raw).parts or lex.name != "SKILL.md" or lex.parent.parent.name != "skills"
+            or lex.parent.parent.parent.name != ".claude" or not SKILL_NAME_RE.match(name) or name in (".", "..")):
+        return None, "not a skill folder's SKILL.md (.claude/skills/<name>/SKILL.md): " + str(skill_md)
+    try:
+        if not real.is_file() or real.name != "SKILL.md":
+            return None, "no SKILL.md at " + str(real)
+        if real.stat().st_size > SKILL_FILE_MAX:
+            return None, "skill file too large to draft against"
+    except OSError as e:
+        return None, str(e)
+    return real, ""
+
+
+def _diff_hunks(diff):
+    """([{'start', 'body': [(tag, text)]}], why). One file only; hunk line counts aren't trusted (models get
+    them wrong); a blank line inside a hunk is a blank context line."""
+    lines = diff.replace("\r\n", "\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    files, hunks, cur, i = 0, [], None, 0
+    while i < len(lines):
+        l = lines[i]
+        if l.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+            for h in (l[4:], lines[i + 1][4:]):
+                name = re.sub(r"^[ab]/", "", h.split("\t")[0].strip())
+                if PurePosixPath(name).name != "SKILL.md" or name.startswith("/") or ".." in PurePosixPath(name).parts:
+                    return None, "the diff names a file other than this SKILL.md: " + one_line(h, 60)
+            files, cur, i = files + 1, None, i + 2
+            continue
+        m = HUNK_RE.match(l)
+        if m:
+            cur = {"start": int(m.group(1)), "body": []}
+            hunks.append(cur)
+        elif cur is None or l.startswith("\\"):
+            pass  # preamble (diff --git, index …) or "\ No newline at end of file"
+        elif l == "":
+            cur["body"].append((" ", ""))
+        elif l[0] in " +-":
+            cur["body"].append((l[0], l[1:]))
+        else:
+            return None, "line {} of the diff isn't part of a hunk".format(i + 1)
+        i += 1
+    if files > 1:
+        return None, "the diff touches more than one file"
+    if not hunks or not any(t in "+-" for h in hunks for t, _ in h["body"]):
+        return None, "no hunks"
+    return hunks, ""
+
+
+def _apply_hunks(text, hunks):
+    """(new text, why). Each hunk's context and removed lines must appear exactly (trailing spaces aside) at one
+    place after the previous hunk; ambiguity is broken only by the hunk's own line number. Context lines keep the
+    file's own text."""
+    lines, cursor, delta = text.split("\n"), 0, 0
+    for k, h in enumerate(hunks, 1):
+        old = [t for tag, t in h["body"] if tag in " -"]
+        if not old:
+            return None, "hunk {} has no context to place it".format(k)
+        want = [t.rstrip() for t in old]
+        at = [i for i in range(cursor, len(lines) - len(old) + 1)
+              if [x.rstrip() for x in lines[i:i + len(old)]] == want]
+        if len(at) > 1:
+            at = [i for i in at if i == h["start"] - 1 + delta]
+        if len(at) != 1:
+            return None, "hunk {} does not apply to the current file".format(k)
+        i, j, new = at[0], at[0], []
+        for tag, t in h["body"]:
+            if tag == " ":
+                new.append(lines[j])
+                j += 1
+            elif tag == "-":
+                j += 1
+            else:
+                new.append(t)
+        lines[i:j] = new
+        cursor, delta = i + len(new), delta + len(new) - (j - i)
+    return "\n".join(lines), ""
+
+
+def _frontmatter(lines):
+    """The frontmatter block's lines: from a first line '---' to the next '---'. An unclosed block runs to the
+    end of the file (so nothing in it can change). [] when the file has none."""
+    if not lines or lines[0].strip() != "---":
+        return []
+    for j in range(1, len(lines)):
+        if lines[j].strip() == "---":
+            return lines[:j + 1]
+    return lines[:]
+
+
+def check_skill_patch(before, diff):
+    """(after, normalized diff, '') when a drafted diff may be offered, else (None, '', why). Code decides: it must
+    apply cleanly to the file as it is now, leave the frontmatter block byte-for-byte alone (it decides when and
+    with what tools a skill loads), change at most SKILL_PATCH_MAX_LINES lines, add at least one line and remove
+    at most SKILL_PATCH_MAX_REMOVED (never one that asks, confirms, verifies or says never/don't), and every added
+    or removed line must pass the quote/statement filters plus SKILL_LINE_RE, and claim no tool is broken. The
+    file's line endings are kept. The normalized diff is rebuilt from before/after, so what the person reviews is
+    exactly what a yes applies."""
+    import difflib
+    if not isinstance(diff, str) or not diff.strip():
+        return None, "", "no diff"
+    crlf = "\r\n" in before
+    if crlf:
+        if before.count("\r\n") != before.count("\n"):
+            return None, "", "the skill file has mixed line endings"
+        before = before.replace("\r\n", "\n")
+    hunks, why = _diff_hunks(diff)
+    if why:
+        return None, "", why
+    after, why = _apply_hunks(before, hunks)
+    if why:
+        return None, "", why
+    if after == before:
+        return None, "", "the diff changes nothing"
+    b, a = before.split("\n"), after.split("\n")
+    if _frontmatter(a) != _frontmatter(b):
+        return None, "", "the diff touches the skill's frontmatter (name, description, tools, model): never patched"
+    ops = difflib.SequenceMatcher(None, b, a, autojunk=False).get_opcodes()
+    changed = sum((i2 - i1) + (j2 - j1) for op, i1, i2, j1, j2 in ops if op != "equal")
+    if changed > SKILL_PATCH_MAX_LINES:
+        return None, "", "{} changed lines (at most {})".format(changed, SKILL_PATCH_MAX_LINES)
+    added = [l for op, i1, i2, j1, j2 in ops if op in ("insert", "replace") for l in a[j1:j2] if l.strip()]
+    removed = [l for op, i1, i2, j1, j2 in ops if op in ("delete", "replace") for l in b[i1:i2] if l.strip()]
+    if not added:
+        return None, "", "the patch only removes lines (a patch adds or rewords a rule)"
+    if len(removed) > SKILL_PATCH_MAX_REMOVED:
+        return None, "", "the patch removes {} lines (at most {})".format(len(removed), SKILL_PATCH_MAX_REMOVED)
+    for line in removed:
+        if SKILL_SAFETY_RE.search(_normalized(line)):
+            return None, "", "the patch removes or rewords a safety line: " + one_line(line.strip(), 80)
+    for side, line in [("an added", l) for l in added] + [("a removed", l) for l in removed]:
+        st = line.strip()
+        if not (len(st) <= STATEMENT_MAX and _text_ok(line) and quote_ok(line)) or SKILL_LINE_RE.search(_normalized(st)):
+            return None, "", side + " line fails the instruction/link/secret filters: " + one_line(st, 80)
+        if side == "an added" and NEGATIVE_TOOL_RE.search(st):
+            return None, "", "an added line makes a negative claim about a tool: " + one_line(st, 80)
+    norm = "\n".join(difflib.unified_diff(b, a, "a/SKILL.md", "b/SKILL.md", lineterm="")) + "\n"
+    return (after.replace("\n", "\r\n") if crlf else after), norm, ""
+
+
+def _sha256(data) -> str:
+    return hashlib.sha256(data if isinstance(data, bytes) else data.encode("utf-8")).hexdigest()
+
+
+def skill_patches_dir() -> Path:
+    return home_dir() / "skill-patches"
+
+
+def _private_write(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+
+
+def read_patch(pid):
+    if not PATCH_ID_RE.match(pid or ""):
+        return None
+    try:
+        m = json.loads((skill_patches_dir() / (pid + ".json")).read_text())
+    except (OSError, ValueError):
+        return None
+    return m if isinstance(m, dict) and m.get("id") == pid else None
+
+
+def write_patch(meta) -> None:
+    _private_write(skill_patches_dir() / (meta["id"] + ".json"), json.dumps(meta, indent=1))
+
+
+def _skills_ledger(entry) -> None:
+    fd = os.open(str(home_dir() / "skills-ledger.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(dict({"at": now().isoformat(timespec="seconds")}, **entry)) + "\n")
+
+
+def _append_outcome(rec) -> None:
+    fd = os.open(str(outcomes_path()), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(dict({"at": now().isoformat(timespec="seconds")}, **rec)) + "\n")
+
+
+def _write_in_place(target: Path, text: str) -> None:
+    """Atomic replace of a real file (never a symlink: callers pass the resolved path), keeping its mode."""
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".core-skill-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, target.stat().st_mode & 0o7777)
+        os.replace(tmp, str(target))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def prior_skill_corrections(skill_md, quote, exclude, limit=SKILL_PRIOR_MAX):
+    """Earlier corrections of the same skill, from the session index: the person's own messages, in other
+    sessions, inside that skill's span, shaped like a directive, not tentative, sharing at least two content
+    words with this correction. Exact messages (newest first, one per session); no model involved. Headless runs
+    are never evidence (their "user" turns are an agent's). Read-only: a stale index gives none, never a rebuild."""
+    if not sessions_db_path().exists():
+        return []
+    target = os.path.realpath(str(skill_md))
+    qs = {w[:5] for w in _content_words(quote)}
+    need = min(2, len(qs))
+    if not need:
+        return []
+    try:
+        con, _ = _sessions_reader()
+    except SessionsIndexStale:
+        return []
+    try:
+        by = {}
+        for p, n, md in con.execute("SELECT path, line, skill_md FROM loads WHERE path != ? ORDER BY path, line",
+                                    (str(exclude),)):
+            by.setdefault(p, []).append((n, md))
+        hits = []
+        for p, ls in by.items():
+            for i, (n, md) in enumerate(ls):
+                if os.path.realpath(md) != target:
+                    continue
+                end = ls[i + 1][0] if i + 1 < len(ls) else 1 << 62
+                for line, text, ts in con.execute("SELECT line, text, ts FROM msgs WHERE path = ? AND role = 'user' "
+                                                  "AND headless = 0 AND line > ? AND line < ? ORDER BY line", (p, n, end)):
+                    if (len(text) <= 2000 and quote_ok(text) and not is_tentative(text) and DIRECTIVE_RE.search(text)
+                            and len({w[:5] for w in _content_words(text)} & qs) >= need):
+                        hits.append({"path": p, "line": line, "text": text, "ts": ts or ""})
+    finally:
+        con.close()
+    out, seen = [], set()
+    for h in sorted(hits, key=lambda h: h["ts"], reverse=True):
+        if h["path"] not in seen:
+            seen.add(h["path"])
+            out.append(h)
+    return out[:limit]
+
+
+def skill_offer_changes(norm):
+    """The patch's own +/- lines, quoted and cut to fit SKILL_OFFER_LINES_CHARS: what a yes writes, shown first in
+    the offer, never only a model's summary of it."""
+    lines = [(l[0], l[1:].strip()) for l in norm.split("\n")[2:] if l[:1] in "+-" and l[1:].strip()]
+    out, used = [], 0
+    for k, (sign, text) in enumerate(lines):
+        room = min(100, SKILL_OFFER_LINES_CHARS - used - 3)
+        if room < 24:
+            out.append("(+{} more line{})".format(len(lines) - k, "" if len(lines) - k == 1 else "s"))
+            break
+        out.append('{}"{}"'.format(sign, one_line(text, room)))
+        used += len(out[-1]) + 1
+    return " ".join(out)
+
+
+def skill_offer_text(name, real, item, path, priors, norm, pid):
+    shown = re.sub(r"https?://\S+|www\.\S+|\b[\w-]+(\.[\w-]+)+/\S*", "[link]", item["quote"])
+    again = "; said in {} earlier session{} too".format(len(priors), "" if len(priors) == 1 else "s") if priors else ""
+    return (SKILL_OFFER_HEAD + '{}: {} — they said "{}" ({}:{}{}). Full diff: {} · skill: {}'.format(
+        name, skill_offer_changes(norm), one_line(shown, 100), Path(str(path)).stem[:8], item["line"], again,
+        display_path(skill_patches_dir() / (pid + ".diff")), display_path(real)))
+
+
+def skill_offer_pass(state, model, url, api, start, offer_types):
+    """Part of the sweep (never in shadow mode or during an outage). ONE skill-patch offer open at a time (none
+    while another is pending, deferred or waiting for a slot), and only when today's asks budget has room: the
+    drafter isn't even called for an ask that can't be made. An offered candidate leaves the queue (its
+    correction's home is now the skill, so no memory offer repeats it); a candidate whose draft fails or is
+    declined by the drafter goes on as an ordinary memory candidate. A stale offer (yes refused: the file had
+    changed) doesn't block the same correction from a fresh draft."""
+    cands = [q for q in state["queue"] if q.get("skill")]
+    if not cands:
+        return
+    inbox = read_inbox()
+    mine = [it for it in inbox if it["source"] == "skill" and item_origin(it) == "internal"]
+    if any(it["status"] in ("pending", "deferred", "waiting") for it in mine) or asks_today(inbox) >= ask_cap():
+        return  # a skill offer is still open, or there's no ask left today
+    never = {(it.get("tags") or {}).get("skill_md") for it in mine if it["status"] == "never"}
+    keys = {it["key"] for it in inbox if it["status"] != "stale"}
+    with contextlib.suppress(Exception):
+        sessions_index()  # earlier sessions are evidence; the refresh is incremental
+    ranked = []
+    for q in cands:
+        try:
+            priors = prior_skill_corrections(q["skill"]["skill_md"], q["item"]["quote"], q["path"])
+        except Exception:
+            priors = []
+        ranked.append((len(priors), q, priors))
+    ranked.sort(key=lambda r: -r[0])  # a skill corrected across sessions first; otherwise oldest first
+
+    def demote(q, why):
+        _sweep_log({"at": now().isoformat(timespec="seconds"), "skill": q["skill"].get("skill_md"),
+                    "quote": q["item"]["quote"], "no_patch": why})
+        q.pop("skill", None)
+
+    tries = 0
+    for _, q, priors in ranked:
+        sk, it = q["skill"], q["item"]
+        real, why = skill_patchable(sk["skill_md"])
+        if not real or str(real) in never:
+            demote(q, why or "they said never to patches for this skill")
+            continue
+        key = "skill:" + hashlib.sha1("{}\n{}".format(real, _squash(it["quote"])).encode()).hexdigest()[:12]
+        if key in keys:
+            state["queue"] = [x for x in state["queue"] if x is not q]  # already offered: never twice
+            continue
+        if tries >= SKILL_DRAFTS_PER_RUN or time.monotonic() - start > SWEEP_DEADLINE:
+            break
+        tries += 1
+        before_bytes = real.read_bytes()
+        try:
+            before = before_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            demote(q, "skill file isn't UTF-8")
+            continue
+        prior = "".join('Said in an earlier session with this skill (verbatim): "{}"\n'.format(one_line(h["text"], 200))
+                        for h in priors)
+        try:
+            v = model_json(SKILL_PATCH_PROMPT.format(max_lines=SKILL_PATCH_MAX_LINES, name=sk["name"], content=before,
+                                                     quote=it["quote"], statement=it["statement"], prior=prior),
+                           model, url, api=api, schema=SKILL_PATCH_SCHEMA, timeout=300)
+        except ExtractorUnavailable as e:
+            print("skill patch not drafted — couldn't reach the model: {}".format(one_line(str(e), 200)), file=sys.stderr)
+            break  # candidates wait for the next run
+        except Exception as e:
+            demote(q, "drafter reply unusable: " + one_line(str(e), 120))
+            continue
+        diff = v.get("diff") if isinstance(v, dict) else None
+        if not isinstance(diff, str) or not diff.strip():
+            demote(q, "the drafter proposed no change")
+            continue
+        after, norm, why = check_skill_patch(before, diff)
+        if after is None:
+            demote(q, why)
+            continue
+        plus = sum(1 for l in norm.split("\n")[2:] if l.startswith("+"))
+        summary = v.get("summary") if isinstance(v.get("summary"), str) and statement_ok(v["summary"]) \
+            else "adds {} line(s) to the skill".format(plus)
+        pid = hashlib.sha1("{}\n{}".format(key, _sha256(before_bytes)).encode()).hexdigest()[:12]  # per file version
+        _private_write(skill_patches_dir() / (pid + ".diff"), norm)
+        write_patch({"id": pid, "skill": sk["name"], "path": str(real), "before_sha": _sha256(before_bytes),
+                     "after_sha": _sha256(after), "quote": it["quote"], "statement": it["statement"],
+                     "transcript": q["path"], "line": it["line"], "summary": summary,
+                     "priors": [{"path": h["path"], "line": h["line"]} for h in priors],
+                     "drafted_at": now().isoformat(timespec="seconds")})
+        deliver_item(skill_offer_text(sk["name"], real, it, q["path"], priors, norm, pid), "skill", key,
+                     offer=True, tags={"type": "skill-patch", "patch": pid, "skill": sk["name"], "skill_md": str(real)},
+                     _internal=True)
+        state["queue"] = [x for x in state["queue"] if x is not q]
+        break
+    state["queue"] = [q for q in state["queue"] if q.get("skill") or q["item"]["type"] in offer_types]
+    _save_sweep_state(state)
+
+
+def apply_skill_patch(pid, oid=""):
+    """On the person's yes to core's own skill offer. (ok, message). Refuses when the file changed since the patch
+    was drafted (hash), re-checks the patch, keeps a rollback copy, writes atomically, logs it."""
+    meta = read_patch(pid)
+    if not meta:
+        return False, "patch {} is missing; nothing was written".format(pid)
+    target = Path(meta["path"])
+    try:
+        cur = target.read_bytes()
+    except OSError as e:
+        return False, "can't read {}: {}; nothing was written".format(target, e)
+    entry = {"patch": pid, "skill": meta.get("skill"), "path": str(target), "offer": oid}
+    after = None
+    if _sha256(cur) == meta.get("before_sha"):
+        try:
+            norm = (skill_patches_dir() / (pid + ".diff")).read_text()
+            after, _, _ = check_skill_patch(cur.decode("utf-8"), norm)
+        except (OSError, UnicodeDecodeError):
+            after = None
+    if after is None or _sha256(after) != meta.get("after_sha"):
+        _skills_ledger(dict(entry, action="refused", why="skill changed since the offer"))
+        return False, ("{} changed since this patch was offered, so nothing was written (your version stands; a "
+                       "new correction can bring a fresh patch)".format(display_path(target)))
+    _private_write(skill_patches_dir() / (pid + ".orig"), cur.decode("utf-8"))
+    _write_in_place(target, after)
+    meta["applied_at"] = now().isoformat(timespec="seconds")
+    meta["offer"] = oid
+    write_patch(meta)
+    _skills_ledger(dict(entry, action="applied", before_sha=meta["before_sha"], after_sha=meta["after_sha"],
+                        rollback=str(skill_patches_dir() / (pid + ".orig"))))
+    _append_outcome({"kind": "skill-apply", "source": "skill", "outcome": "applied", "patch": pid,
+                     "skill": meta.get("skill")})
+    append_ledger(now(), "skill {} patched on their yes: {}".format(meta.get("skill"), one_line(meta.get("summary", ""), 120)))
+    return True, "patched {} ({}) — undo: core skill undo {}".format(meta.get("skill"), display_path(target), pid)
+
+
+def record_skill_next_use(loads, hits):
+    """After a yes, the next session that loads the patched skill says whether the patch helped: was the skill
+    corrected again inside that load's span (a gated sweep correction), or not. Recorded once per patch."""
+    for f in sorted(skill_patches_dir().glob("*.json")) if skill_patches_dir().is_dir() else []:
+        meta = read_patch(f.stem)
+        if not meta or not meta.get("applied_at") or meta.get("next_use") or meta.get("undone_at"):
+            continue
+        try:
+            applied = _when(meta["applied_at"])
+        except (TypeError, ValueError):
+            continue
+        for l in loads:
+            try:
+                used = _when(l["ts"].replace("Z", "+00:00"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if os.path.realpath(l["skill_md"]) != meta["path"] or used <= applied:
+                continue
+            outcome = "corrected" if any(h[0] == l["skill_md"] and h[1] == l["line"] for h in hits) else "clean"
+            meta["next_use"] = {"at": l["ts"], "line": l["line"], "outcome": outcome}
+            write_patch(meta)
+            _append_outcome({"kind": "skill-use", "source": "skill", "outcome": outcome, "patch": meta["id"],
+                             "skill": meta.get("skill"), "used_at": l["ts"]})
+            break
+
+
+def cmd_skill(args) -> int:
+    """`core skill` lists offered/applied patches; `core skill undo <id>` restores the rollback copy."""
+    if args.skill_cmd == "undo":
+        meta = read_patch(args.patch_id or "")
+        if not meta or not meta.get("applied_at"):
+            print("core skill: no applied patch {}".format(args.patch_id), file=sys.stderr)
+            return 1
+        if meta.get("undone_at"):
+            print("core skill: patch {} was already undone".format(meta["id"]), file=sys.stderr)
+            return 1
+        target, orig = Path(meta["path"]), skill_patches_dir() / (meta["id"] + ".orig")
+        try:
+            cur, back = target.read_bytes(), orig.read_text()
+        except OSError as e:
+            print("core skill: {}".format(e), file=sys.stderr)
+            return 1
+        if _sha256(cur) != meta["after_sha"]:
+            print("core skill: {} changed after the patch; nothing restored (the original is at {})".format(
+                display_path(target), display_path(orig)), file=sys.stderr)
+            return 1
+        _write_in_place(target, back)
+        meta["undone_at"] = now().isoformat(timespec="seconds")
+        write_patch(meta)
+        _skills_ledger({"action": "undone", "patch": meta["id"], "skill": meta.get("skill"), "path": str(target)})
+        print("restored {} as it was before patch {}".format(display_path(target), meta["id"]))
+        return 0
+    metas = [m for m in (read_patch(f.stem) for f in sorted(skill_patches_dir().glob("*.json"))) if m] \
+        if skill_patches_dir().is_dir() else []
+    if not metas:
+        print("no skill patches")
+    for m in metas:
+        state = "undone" if m.get("undone_at") else "applied {}".format(m["applied_at"][:10]) if m.get("applied_at") \
+            else "offered {}".format(m.get("drafted_at", "?")[:10])
+        nxt = " · next use: " + m["next_use"]["outcome"] if m.get("next_use") else ""
+        print("{}  {}  {}{} — {}".format(m["id"], m.get("skill"), state, nxt, one_line(m.get("summary", ""), 90)))
+    return 0
+
+
 # ---- the evening pass: a wrap for tomorrow + at most one insight that must cite its evidence ----
 INSIGHT_PROMPT = """You are a careful personal assistant reviewing the person's day. Context lines (verbatim):
 {context}
@@ -1764,7 +2802,7 @@ Offer AT MOST ONE thing worth their attention tomorrow, and only if it contains 
 connection between two things they hadn't joined (e.g. two open items about the same client, a decision that
 conflicts with a loop, something overdue that blocks something else). Generic advice, reminders of a single
 item, or anything not grounded in these lines is noise: answer {{"offer": null}}.
-Reply with only JSON: {{"offer": {{"text": "<one or two plain sentences>", "evidence": ["<exact line>", ...]}}}}
+{already}Reply with only JSON: {{"offer": {{"text": "<one or two plain sentences>", "evidence": ["<exact line>", ...]}}}}
 or {{"offer": null}}. Every evidence entry must be copied exactly from the context lines."""
 
 
@@ -1844,16 +2882,45 @@ def evidence_ok(line: str) -> bool:
     return quote_ok(line) and statement_ok(line)
 
 
+INSIGHT_ALREADY_SHOWN = 5
+
+
+def earlier_insights():
+    """Every insight core has delivered, in any status (answered, acked, stale too), oldest first."""
+    return [it for it in read_inbox() if it["source"] == "evening" and item_origin(it) == "internal"
+            and (it.get("tags") or {}).get("type") == "insight"]
+
+
+def insight_evidence(ev):
+    """The evidence an insight cites, squashed and sorted: what makes two insights the same insight."""
+    return sorted({_squash(e) for e in ev})
+
+
+def insight_is_repeat(ev, earlier) -> bool:
+    """True unless it cites at least one line no earlier insight cited (a line contained in, or containing, an
+    earlier cited line is the same line). A rephrased connection over the same lines is the same insight."""
+    cited = []
+    for it in earlier:
+        with contextlib.suppress(ValueError, TypeError):
+            cited += [c for c in json.loads((it.get("tags") or {}).get("evidence") or "[]") if isinstance(c, str)]
+    return all(any(e in c or c in e for c in cited) for e in insight_evidence(ev))
+
+
 def evening_insight(today, context):
     """((text, evidence) or None, status). status: 'no-model', 'outage' (couldn't reach the model), or 'ok'.
-    Sends the context lines (today's ledger, decisions, open loops, inbox text) to the configured model."""
+    Sends the context lines (today's ledger, decisions, open loops, inbox text) to the configured model, with the
+    last few insights it already offered (those that pass the display filters) so it doesn't rephrase them."""
     model, url, api = sweep_config()
     if not model:
         return None, "no-model"
     if not context:
         return None, "ok"
+    shown = [one_line(it["text"], 200) for it in earlier_insights() if display_ok(it["text"])][-INSIGHT_ALREADY_SHOWN:]
+    already = ("Already offered on earlier evenings (never offer these again or rephrase them; offer something only "
+               "if it cites lines these didn't):\n" + "".join("- {}\n".format(t) for t in shown)) if shown else ""
     try:
-        v = model_json(INSIGHT_PROMPT.format(context="\n".join(context)), model, url, api=api, timeout=300)
+        v = model_json(INSIGHT_PROMPT.format(context="\n".join(context), already=already), model, url, api=api,
+                       timeout=300)
     except ExtractorUnavailable as e:
         print("evening: couldn't reach the insight model: {}".format(one_line(str(e), 200)), file=sys.stderr)
         return None, "outage"
@@ -1881,16 +2948,25 @@ def cmd_evening(args) -> int:
                 resolve_items(it["key"])
     deliver_item(evening_wrap(today), "evening", "evening:" + today, replace=True, _internal=True)
     found, status = evening_insight(today, evening_context(today))
-    held = False
+    held = repeat = False
     if found:
         text, ev = found
-        iid = deliver_item("{} (from: {})".format(text, "; ".join(one_line(e, 60) for e in ev[:2])), "evening",
-                           "insight:" + today, offer=True, tags={"type": "insight"}, _internal=True)
-        cur = read_item(inbox_dir() / (iid + ".json"))
-        held = bool(cur and cur["status"] == "waiting")
+        cited = insight_evidence(ev)
+        key = "insight:" + hashlib.sha1("\n".join(cited).encode("utf-8")).hexdigest()[:12]
+        with inbox_lock():  # one check-and-deliver: two evenings at once can't both offer it
+            earlier = earlier_insights()
+            repeat = any(it["key"] == key for it in earlier) or insight_is_repeat(ev, earlier)
+            if not repeat:
+                iid = deliver_item("{} (from: {})".format(text, "; ".join(one_line(e, 60) for e in ev[:2])), "evening",
+                                   key, offer=True, tags={"type": "insight", "evidence": json.dumps(cited)},
+                                   _internal=True)
+                cur = read_item(inbox_dir() / (iid + ".json"))
+                held = bool(cur and cur["status"] == "waiting")
     note = {"no-model": "no insight model configured (sweep_model in recall.conf)",
-            "outage": "insight model unreachable"}.get(status, ("1 insight held for a free ask slot" if held else
-                                                                "1 insight offered") if found else "no insight cleared the bar")
+            "outage": "insight model unreachable"}.get(status, (
+                "no new insight (the one found was already offered)" if repeat else
+                "1 insight held for a free ask slot" if held else "1 insight offered") if found else
+        "no insight cleared the bar")
     print("evening: wrap delivered; " + note)
     return 1 if status == "outage" else 0  # the heartbeat alarms on an outage; the wrap still went out
 
@@ -1950,9 +3026,7 @@ def _inbox_lock_cm():
         finally:
             _INBOX_LOCK_DEPTH[0] -= 1
         return
-    d = inbox_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    with open(str(d / ".lock"), "a") as fh:
+    with open_lock_file(inbox_dir() / ".lock") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         _INBOX_LOCK_DEPTH[0] = 1
         try:
@@ -2123,7 +3197,8 @@ def log_outcome(item, outcome, note="", late=False):
 
 def write_item(item: dict) -> None:
     d = inbox_dir()
-    d.mkdir(parents=True, exist_ok=True)
+    ensure_home()
+    d.mkdir(exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".item-")
     with os.fdopen(fd, "w") as f:
         json.dump(item, f, indent=1)
@@ -2194,10 +3269,10 @@ def render_inbox(items, limit=INBOX_SHOW, full=False):
 # can never speak as a producer: not its source, not its keys, not the tags that carry or mark a grant, not the
 # words core uses to say something is pre-approved. Items record their origin; a key is shared (replace, upgrade
 # to an offer, dedupe) only within one origin and source, so a CLI call can never rewrite a producer's item.
-RESERVED_SOURCES = frozenset({"sweep", "evening", "overnight", "permissions"})
-RESERVED_KEY_PREFIXES = ("grant:", "sweep:", "insight:", "evening:", "overnight:")
-RESERVED_TAGS = ("grant", "granted", "grant_job", "cmd_sha", "v")
-RESERVED_PHRASES = ("preapproved", "standingpermission", "sweepoffer")  # core's own leads, compared squashed
+RESERVED_SOURCES = frozenset({"sweep", "evening", "overnight", "permissions", "skill"})
+RESERVED_KEY_PREFIXES = ("grant:", "sweep:", "insight:", "evening:", "overnight:", "skill:")
+RESERVED_TAGS = ("grant", "granted", "grant_job", "cmd_sha", "v", "patch")
+RESERVED_PHRASES = ("preapproved", "standingpermission", "sweepoffer", "skillpatchoffer")  # core's own leads, compared squashed
 ORIGINS = ("cli", "internal")
 
 
@@ -2460,6 +3535,8 @@ def cmd_offer(args) -> int:
             return 0
         by = {}
         for r in rows:
+            if r.get("kind"):
+                continue  # skill patch effects, not answers (below)
             c = by.setdefault(r.get("source") or "?", {})
             c[r["outcome"]] = c.get(r["outcome"], 0) + 1
         inv = {v: k for k, v in ANSWERS.items()}
@@ -2471,6 +3548,16 @@ def cmd_offer(args) -> int:
         for t, c in sorted(learn_offer_types(rows).items(), key=lambda x: -x[1]["score"]):
             print("  {}: {} yes / {} no → score {:.2f}{}".format(t, c["yes"], c["no"], c["score"],
                                                                 " — PAUSED (keeps being declined)" if c["paused"] else ""))
+        eff = {}
+        for r in rows:
+            if r.get("kind") in ("skill-apply", "skill-use"):
+                c = eff.setdefault(r.get("skill") or "?", {})
+                c[r["outcome"]] = c.get(r["outcome"], 0) + 1
+        if eff:
+            print("skill patches (after a patch, was the skill's next use corrected again?):")
+        for name, c in sorted(eff.items()):
+            print("  {}: {} applied · next use: {} clean, {} corrected".format(
+                name, c.get("applied", 0), c.get("clean", 0), c.get("corrected", 0)))
         return 0
     if not args.item_id:
         print("usage: core offer yes|no|later|never <id> [--note why]", file=sys.stderr)
@@ -2494,6 +3581,15 @@ def cmd_offer(args) -> int:
             return 1
         late = cur["status"] == "unanswered"
         outcome = ANSWERS[args.answer]
+        pid, applied = (cur.get("tags") or {}).get("patch"), ""
+        if outcome == "accepted" and pid and cur.get("source") == "skill" and item_origin(cur) == "internal":
+            ok, applied = apply_skill_patch(pid, oid)  # the only way a skill is ever changed
+            if not ok:  # nothing was applied, so it isn't a yes to learn from: stale (a fresh draft may follow)
+                cur.update(status="stale", stale_at=now().isoformat(timespec="seconds"), stale_why=applied)
+                write_item(cur)
+                log_outcome(cur, "stale", args.note or "", late=late)
+                print("core offer: {} not applied (now stale): {}".format(oid, applied), file=sys.stderr)
+                return 1
         tagged = (cur.get("tags") or {}).get("grant")
         # Only an offer core itself made (origin internal, its reserved grant tag) can become a standing permission.
         scope = tagged if item_origin(cur) == "internal" else None
@@ -2516,6 +3612,12 @@ def cmd_offer(args) -> int:
         maybe_propose_grant(cur)
     print("{}: {}{}{}".format(oid, outcome, " until " + cur["until"][:10] if outcome == "deferred" else "",
                               " (late: after the offer had expired)" if late else ""))
+    if outcome == "accepted" and pid and cur.get("source") == "skill":
+        if item_origin(cur) != "internal":
+            print("core offer: this offer wasn't made by core itself, so a yes to it changes nothing", file=sys.stderr)
+            return 1
+        print(applied)  # applied above, inside the lock
+        return 0
     if ungrantable:
         print("core offer: no standing permission written: " + ungrantable, file=sys.stderr)
     elif scope and outcome == "accepted":
@@ -2767,12 +3869,20 @@ DURATION_RE = re.compile(r"^(\d+)([mhd])$")
 DURATION_SECONDS = {"m": 60, "h": 3600, "d": 86400}
 
 
+def open_lock_file(path: Path):
+    """A lock file opened for flock, created 0600 whatever the umask (CORE_HOME itself 0700)."""
+    ensure_home()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "a")
+
+
 @contextlib.contextmanager
 def file_lock(path: Path, blocking: bool = True):
     """flock on path. Yields True when held; with blocking=False yields False if someone else holds it.
     The OS drops the lock when the holder dies, so a crashed job never leaves a stale lease."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path), "a") as fh:
+    with open_lock_file(path) as fh:
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         except (BlockingIOError, PermissionError):
@@ -3300,7 +4410,7 @@ def load_overnight_state():
 
 
 def save_overnight_state(st):
-    home_dir().mkdir(parents=True, exist_ok=True)
+    ensure_home()
     fd, tmp = tempfile.mkstemp(dir=str(home_dir()), prefix=".overnight-")
     with os.fdopen(fd, "w") as f:
         json.dump(st, f, indent=1)
@@ -3472,8 +4582,8 @@ def render_overnight_report(date, r, limit=INBOX_TEXT_CHARS):
 
 def overnight_night(settings, jobs, bad) -> int:
     t0, date = time.monotonic(), now().strftime("%Y-%m-%d")
-    logp = home_dir() / "logs" / "overnight-{}.log".format(date)
-    logp.parent.mkdir(parents=True, exist_ok=True)
+    logp = ensure_home() / "logs" / "overnight-{}.log".format(date)
+    logp.parent.mkdir(exist_ok=True)
     me = [sys.executable, os.path.realpath(__file__)]
     st = load_overnight_state()
     r = {k: [] for k in ("ok", "failed", "paused", "nogrant", "revoked", "cap", "deadline", "busy")}
@@ -3663,6 +4773,18 @@ def main(argv=None) -> int:
     p_sweep = sub.add_parser("sweep", help="offer what's worth remembering from quiet conversations")
     p_sweep.set_defaults(func=cmd_sweep)
 
+    p_sess = sub.add_parser("sessions", help="exact search over past Claude Code conversations: index / search")
+    p_sess.add_argument("sessions_cmd", choices=["index", "search"])
+    p_sess.add_argument("query", nargs="?")
+    p_sess.add_argument("--role", choices=["user", "assistant", "agent"],
+                        help="agent = the brief that started a headless run (needs --headless)")
+    p_sess.add_argument("--project", help="only transcripts whose project folder contains this")
+    p_sess.add_argument("--since", help="YYYY-MM-DD (from local midnight)")
+    p_sess.add_argument("--limit", type=positive_int, default=SESSIONS_LIMIT)
+    p_sess.add_argument("--headless", action="store_true",
+                        help="include headless runs (claude -p / SDK): their prompts are an agent's, not yours")
+    p_sess.set_defaults(func=cmd_sessions)
+
     p_recall = sub.add_parser("recall", help="(UserPromptSubmit hook) cited memory hits for this message")
     p_recall.add_argument("--query", help="search text instead of hook JSON on stdin")
     p_recall.add_argument("--reindex", action="store_true", help="(embeddings) embed new/changed memory files")
@@ -3682,6 +4804,11 @@ def main(argv=None) -> int:
     p_offer.add_argument("item_id", nargs="?")
     p_offer.add_argument("--note", help="why (optional; becomes learning signal)")
     p_offer.set_defaults(func=cmd_offer)
+
+    p_skill = sub.add_parser("skill", help="skill patches offered from corrections: list / undo <patch-id>")
+    p_skill.add_argument("skill_cmd", nargs="?", choices=["list", "undo"], default="list")
+    p_skill.add_argument("patch_id", nargs="?")
+    p_skill.set_defaults(func=cmd_skill)
 
     p_grant = sub.add_parser("grant", help="standing permissions: list / revoke <scope>")
     p_grant.add_argument("grant_cmd", nargs="?", choices=["list", "revoke"], default="list")

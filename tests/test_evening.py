@@ -182,3 +182,63 @@ def test_wrap_mentions_asks_held_for_tomorrow(tmp_path):
         run(tmp_path, "deliver", "question {}".format(i), "--source", "x", "--key", "q{}".format(i), "--offer")
     run(tmp_path, "evening")
     assert "2 asks waiting for tomorrow" in run(tmp_path, "inbox").stdout
+
+
+def run_at(tmp_path, when, *args):
+    env = {"HOME": str(tmp_path), "CORE_HOME": str(tmp_path / "corehome"), "PATH": os.environ["PATH"],
+           "CORE_NOW": when}
+    return subprocess.run(["python3", str(CORE), *args], capture_output=True, text=True, env=env, timeout=60)
+
+
+def insights(tmp_path):
+    d = tmp_path / "corehome" / "inbox"
+    return [it for it in (json.loads(p.read_text()) for p in sorted(d.glob("*.json"))) if it["key"].startswith("insight:")]
+
+
+SAME = {"offer": {"text": "The overdue domain renewal and the unsent invoice are for the same client.",
+                  "evidence": ["renew the client's domain", "send the invoice"]}}
+
+
+def test_the_same_insight_is_not_offered_again_on_later_nights(tmp_path, model):
+    """An insight is worth one ask. The same connection every evening is nagging, whatever date is on it."""
+    setup_day(tmp_path, model)
+    Fake.reply = SAME
+    for day in ("2026-10-01", "2026-10-02", "2026-10-03"):
+        run_at(tmp_path, day + "T21:00:00", "evening")
+    assert len(insights(tmp_path)) == 1
+
+
+def test_an_answered_or_acked_insight_is_still_not_repeated(tmp_path, model):
+    setup_day(tmp_path, model)
+    Fake.reply = SAME
+    run_at(tmp_path, "2026-10-01T21:00:00", "evening")
+    (first,) = insights(tmp_path)
+    run_at(tmp_path, "2026-10-01T21:05:00", "offer", "no", first["id"])
+    Fake.reply = {"offer": {"text": "Renewing the domain and sending the invoice could be one email to that client.",
+                            "evidence": ["send the invoice", "renew the client's domain"]}}  # rephrased, same lines
+    run_at(tmp_path, "2026-10-02T21:00:00", "evening")
+    Fake.reply = {"offer": {"text": "The domain renewal is overdue for the client.",
+                            "evidence": ["renew the client's domain"]}}  # a subset of what was cited: nothing new
+    run_at(tmp_path, "2026-10-03T21:00:00", "evening")
+    assert len(insights(tmp_path)) == 1
+
+
+def test_a_repeat_needs_new_evidence(tmp_path, model):
+    setup_day(tmp_path, model)
+    Fake.reply = SAME
+    run_at(tmp_path, "2026-10-01T21:00:00", "evening")
+    run_at(tmp_path, "2026-10-02T09:00:00", "loop", "add", "call the client about the server move")
+    Fake.reply = {"offer": {"text": "The renewal, the invoice and the server move are all one client: one call.",
+                            "evidence": ["renew the client's domain", "call the client about the server move"]}}
+    run_at(tmp_path, "2026-10-02T21:00:00", "evening")
+    assert len(insights(tmp_path)) == 2
+
+
+def test_the_model_sees_what_it_already_offered(tmp_path, model):
+    setup_day(tmp_path, model)
+    Fake.reply = SAME
+    run_at(tmp_path, "2026-10-01T21:00:00", "evening")
+    Fake.calls = []
+    run_at(tmp_path, "2026-10-02T21:00:00", "evening")
+    prompt = Fake.calls[-1]["messages"][0]["content"]
+    assert "Already offered" in prompt and "unsent invoice are for the same client" in prompt

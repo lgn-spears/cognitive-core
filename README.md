@@ -72,6 +72,7 @@ it with `core loop add "<promise>"`.
 | `core loop add "promise"` / `core loop done "match"` / `core loop` | open, close, list promises |
 | `core day [date]` | replay one day's full ledger |
 | `core search "query"` | search every day's ledger |
+| `core sessions search "query" [--role user\|assistant\|agent] [--project X] [--since YYYY-MM-DD] [--limit N] [--headless]` / `core sessions index` | exact search over your past Claude Code conversations: the actual messages, cited `file:line`, newest first (see below) |
 | `core doctor` | health check: overdue loops, stale file references |
 | `core close` | silently mark activity (stop hooks) |
 | `core recall` | (UserPromptSubmit hook) cited memory lines for this message + undelivered results; `--reindex` builds the optional embedding index |
@@ -81,6 +82,7 @@ it with `core loop add "<promise>"`.
 | `core deliver ... --replace` | same key while pending → update that item's text to this one (without it the pending text is kept, and it tells you) |
 | `core run NAME [--timeout S] -- CMD...` | run a background job under a lease (no overlap; if the wrapper is killed it kills the job's process group, and a still-alive orphan from a hard kill blocks the next run and keeps alarming), with a timeout that kills its whole process group, recording start/finish/status/last line in `~/.core/heartbeat.json` |
 | `core offer yes\|no\|later\|never <id> [--note why]` / `core offer stats` | record the person's answer to an offer (later = back in 3 days; never = never re-asked; an offer left unanswered for a week *after it was first shown* expires as "unanswered" — no answer, not a no — and a late answer to it is still recorded, marked late). `--note` keeps their words; it is required to accept a standing-permission proposal |
+| `core skill` / `core skill undo <patch-id>` | list skill patches offered from your corrections (offered / applied / undone, and how the next use went) / put a patched SKILL.md back exactly as it was, if it hasn't changed since (see skill-patch offers below) |
 | `core grant` / `core grant revoke <scope>` | list standing permissions (scope, date, the person's own words) / revoke one; anything already queued under it goes back to being an offer |
 | `core sweep` | offer what's worth remembering from quiet conversations (see below) |
 | `core evening` | nightly wrap for tomorrow + at most one insight offer that cites its evidence (see below; sends data to the sweep model) |
@@ -156,6 +158,45 @@ since the last index, and memories under ~30 chunks, are matched by words. `tool
 scores recall against your own labeled messages — a JSON list of
 `{"prompt": "...", "expect": "recall" | "silent", "relevant": ["note_name", ...], "split": "dev"}`.
 
+**Session search** (`core sessions`) finds what was actually said in past Claude Code conversations — your
+messages and the assistant's visible replies (no tool output, subagents, hook injections or compaction
+summaries) — and prints the messages themselves, never a model's summary of them: no model is involved, so
+nothing is paraphrased or made up. Every word must match; `"quoted words"` match as a phrase. There is no
+other query syntax: `-word`, `OR` and `prefix*` are searched as plain words (`sqlite*` finds "sqlite", not
+"sqlite3"). With FTS5, accents are folded (`cafe` finds "café"); without it they must match exactly. Words
+are split on spaces and punctuation, so a run of Chinese or Japanese with no spaces is one word: search for
+the whole run, not part of it.
+
+```
+$ core sessions search "postgres overkill"
+== -Users-sam-code-shop · 5f1c9e2a-… ==
+   began: kick off the shop checkout work
+   ended: ship it friday
+  ~/.claude/projects/-Users-sam-code-shop/5f1c9e2a-….jsonl:2  user  2026-09-01 05:01
+    let's use SQLite for the cart, Postgres is overkill here
+
+1 message(s) in 1 session(s)
+```
+
+The index also records which skills each conversation loaded (used to find earlier corrections of a skill).
+Each session with a hit shows how it began and how it ended (your first and last message), so you can tell
+which conversation it was. `core sessions index` builds or refreshes the index; `core sweep` refreshes it at
+the start of every run (incremental: only new or changed transcripts are read, deleted ones are dropped). It
+reads every `*.jsonl` in `~/.claude/projects/*/` (or your `sweep_dir`s), skipping subagent transcripts and
+core's own model calls. **Headless runs** (sessions started by `claude -p` or the Agent SDK: `entrypoint`
+`sdk-*` in the transcript) are indexed but hidden; `--headless` includes them, and their "user" turns are
+labelled `agent` (`--role agent`), because they're another agent's brief, not you. `--since YYYY-MM-DD`
+counts from your local midnight. It uses SQLite full-text search (FTS5) when your Python's SQLite has it,
+and a slower plain scan when it doesn't. Searching never changes the index: one built by an older core says
+`index needs rebuild: run core sessions index`. A refresh commits once, at the end, so a search during one
+reads the whole previous index (never a half-refreshed one), and an interrupted refresh leaves it as it was. A
+headless run's opening and closing lines are shown as `agent began:` / `agent ended:`. If the index file isn't
+readable (or, for `index`, writable) by you, the command says so instead of suggesting a rebuild.
+
+**The index holds the raw text of your conversations.** It lives only at `~/.core/sessions.db`, readable by
+you alone (mode 0600), and is never sent anywhere — searching it makes no network calls. Delete the file to
+forget it; the next index rebuilds it from your transcripts.
+
 **Optional: the quiet sweep** (`core sweep`) reads Claude Code conversations once they've been idle 30
 minutes and *offers* what's worth remembering — decisions, corrections, durable facts, preferences, open
 loops — through the inbox. It never writes memory itself: every offer quotes the person's own words
@@ -170,6 +211,8 @@ sweep_model qwen3:8b            # any Ollama model; or a model name with sweep_a
 # sweep_offer_types fact preference correction   # the rest is logged only
 # asks_per_day 5               # one daily budget for EVERY ask (sweep, evening, grant proposals, deliver --offer)
 # sweep_shadow on               # log what it would offer to ~/.core/sweep.log, offer nothing
+# sweep_headless on             # also read headless runs (claude -p / Agent SDK). Off by default: their
+                                # "user" turns are an agent's brief, not your words
 # sweep_key_file ~/.config/x/key  # API key for a hosted OpenAI-compatible server (a file holding the key,
                                   # or a line like `export X=key`); $SWEEP_API_KEY wins if set. Never logged.
 ```
@@ -182,6 +225,51 @@ no saved transcript. **Where conversations go is `sweep_url`'s / the extractor's
 model keeps them on this machine. Measured on real conversations with blind judges, extraction
 quality depends heavily on the model; test yours with `tools/eval_recall.py`-style labels before
 turning offers on (start in shadow).
+
+**Skill-patch offers.** When you correct the assistant while a Claude Code skill is in use, the sweep can offer a
+concrete patch to that skill's `SKILL.md`. It never edits a skill on its own: the file changes only when you answer
+yes to core's own offer.
+
+- **Evidence, not counters.** It fires when a swept conversation loaded a skill (the `Skill` tool, or the
+  `Base directory for this skill:` text Claude Code injects for it and for `/skill-name`) *and*, inside that
+  skill's span (until the next skill is loaded), you made a correction that passed the sweep's quote gate: your
+  verbatim words, not a question or a maybe. Session length and tool counts never trigger it. If the session
+  index finds you said much the same thing while the same skill was loaded in earlier sessions, those messages
+  are cited and that skill goes first.
+- **A model drafts, code decides.** The sweep model (same `sweep_model` / `sweep_api`) gets the skill file, your
+  words and lesson rules: capture the durable rule, fix in place, keep it short, don't restate the
+  skill; never "this tool is broken", environment-specific failures, one-off stories, or failed attempts as best
+  practice. It may answer "no change". A draft becomes an offer only if it applies cleanly to the file as it is
+  now (found by its context lines, uniquely; a diff header naming any file but `SKILL.md` is refused), changes at
+  most 12 lines, leaves the frontmatter block (`---` …
+  `---`: name, description, tools, model) byte-for-byte untouched, adds at least one line and removes at most
+  one — never a line that asks, confirms, verifies or says never/don't — and every added *and* removed line
+  passes the filters for quotes and statements (no instructions, commands, backticks, links, secrets, hidden or
+  lookalike characters) plus a stricter skill filter: no `<` (HTML or comments), no `](` (Markdown links or
+  images), no domains (bare, spelled out like "dot org", or defanged like `[.]`), no API keys, `.env`/env files
+  or credential paths, nothing "without confirmation/asking", no force-push, hard reset or other destructive git,
+  and nothing telling the reader to disregard or ignore earlier guidance. An added line also may not claim a tool
+  is broken. The file's line endings (LF or CRLF) are kept; a file with mixed endings isn't patched. Only a
+  `SKILL.md` inside a `.claude/skills/<name>/` folder qualifies (names are letters, digits, `_`, `.`, `-`; never
+  `.` or `..`; a path that climbs out with `..` is refused). Otherwise your correction goes on as an
+  ordinary memory offer. **This sends the whole skill file to the sweep model.** Skills managed by a plugin
+  (under `~/.claude/plugins/`) are never patched: an update would overwrite the patch.
+- **The offer** (source `skill`) shows the patch's own `+"…"` / `-"…"` lines first (each cut to fit), then your
+  words and the skill's path — never only a model's summary; the full diff, rebuilt by code from before/after so
+  it is exactly what a yes applies, is at `~/.core/skill-patches/<id>.diff`. **One skill offer open at a time**:
+  none is drafted while another is pending, deferred or waiting for a slot, and each is drawn from the shared
+  `asks_per_day`; when there's no room the drafter isn't even called. A correction that became a skill offer
+  isn't also offered as a memory.
+- **Yes** applies it: the file's hash must still match the one drafted against (if you edited the skill since,
+  nothing is written, the yes says so, and the offer becomes `stale` — not accepted, so it teaches the learner
+  nothing; the same correction can come back as a fresh draft against your edited file), a rollback copy goes to `skill-patches/<id>.orig`, the write is atomic
+  (through a symlinked skill folder to the real file), and `~/.core/skills-ledger.jsonl` records it.
+  `core skill undo <id>` restores the original if the file still matches the patch. **No / later** work as for
+  every offer; **never** also stops patch offers for that skill.
+- **Did it help?** After a yes, the next conversation that loads that skill is recorded as `clean` or
+  `corrected` (another correction inside its span), in `offer-outcomes.jsonl`; `core offer stats` shows it per
+  skill. "Corrected" means a correction the sweep would capture, so in-the-moment fixes don't count, and a
+  conversation is judged when the sweep finishes reading it.
 
 **Offers, answers and standing permissions.** Sweep and evening results that need a decision arrive as
 *offers*. The agent asks in one line and records the answer with `core offer yes|no|later|never <id>`;
@@ -198,6 +286,9 @@ slot — becomes an ordinary offer.
 **Optional: the evening pass** (`core evening`) delivers a short wrap for tomorrow (what was decided
 today, overdue loops, offers waiting, unread items, job health), retiring yesterday's wrap, plus at
 most one insight offer, and only when it cites exact lines that pass the same safety filters as quotes.
+An insight is offered once: it is keyed by the lines it cites (not the date), and one that cites no line an
+earlier insight hadn't — answered, acknowledged or not — is dropped, however it is reworded. The model is shown
+the last few insights it offered so it looks for something new.
 With no `sweep_model` it only writes the wrap and says "no insight model configured". **With one, it
 sends today's ledger, your recent decisions, your open loops and the text of pending inbox items to the
 configured sweep model.** A local model keeps that on this machine; `sweep_api claude` sends it to
@@ -246,13 +337,16 @@ result down is never the same as the person having seen it.
 **The deliver boundary:** `core deliver` is for external jobs' reports and offers only. It can never speak
 as one of core's own producers, so it refuses:
 
-- sources `sweep`, `evening`, `overnight`, `permissions` (compared case-blind, lookalike letters folded);
-- keys starting `grant:`, `sweep:`, `insight:`, `evening:`, `overnight:`;
-- tags `grant`, `granted`, `grant_job`, `cmd_sha`, `v` — so it can never ask for, or claim, a standing permission;
-- text claiming a pre-approval or standing permission ("Pre-approved…", "Standing permission…", "Sweep offer…").
+- sources `sweep`, `evening`, `overnight`, `permissions`, `skill` (compared case-blind, lookalike letters folded);
+- keys starting `grant:`, `sweep:`, `insight:`, `evening:`, `overnight:`, `skill:`;
+- tags `grant`, `granted`, `grant_job`, `cmd_sha`, `v`, `patch` — so it can never ask for, or claim, a standing
+  permission, or point an offer at a skill patch;
+- text claiming a pre-approval or standing permission ("Pre-approved…", "Standing permission…", "Sweep offer…",
+  "Skill patch offer…").
 
 Every item records its origin (`cli` or `internal`); `--replace` and `--offer` act only on an item from the same
-origin and source, and a key already used by another producer is refused. `core offer yes` writes a grant only
+origin and source, and a key already used by another producer is refused. `core offer yes` changes a skill only
+for a skill offer core itself made. It writes a grant only
 for an offer core itself made, and always says so: `standing permission granted: <scope> — revoke: core grant
 revoke <scope>`. Items from before origins existed count as `cli`.
 
