@@ -100,5 +100,19 @@ unique_repos() {  # list_repos, with worktrees of the same repository collapsed 
     common="$(cd "$repo" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)"
     [ -n "$common" ] || common="$repo"   # can't resolve: keep the repo, never drop it silently
     printf '%s\t%s\n' "$common" "$repo"
-  done | awk -F '\t' '!seen[$1]++ { print $2 }'
+  done | awk -F '\t' '!seen[$1]++ { print $2 }' | not_ignored
+}
+
+not_ignored() {  # drop repos listed as `ignore_repo <dir>` in audits.conf (work the person is done with)
+  ignored="$(conf_values ignore_repo | while IFS= read -r r; do [ -n "$r" ] && expand_home "$r"; done)"
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    skip=0
+    while IFS= read -r ig; do
+      [ -n "$ig" ] && [ "${repo%/}" = "${ig%/}" ] && skip=1
+    done <<EOF
+$ignored
+EOF
+    [ "$skip" = 1 ] || printf '%s\n' "$repo"
+  done
 }

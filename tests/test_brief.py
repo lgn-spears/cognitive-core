@@ -586,3 +586,15 @@ def test_no_remote_names_the_repos(tmp_path):
     conf(tmp_path, "repo_root {}\n".format(root))
     r = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM))
     assert "Repos: alpha, bravo, charlie." in r.stdout
+
+
+def test_ignored_repo_is_never_reported(tmp_path):
+    # Work the person has finished with (e.g. a former employer's repo) can be left out of every audit.
+    home = tmp_path / "home"
+    old = make_repo(home / "code" / "old-job", 3)
+    add_remote(old, tmp_path / "old.git", push=False)
+    keep = make_repo(home / "code" / "mine", 2)
+    add_remote(keep, tmp_path / "mine.git", push=False)
+    conf(tmp_path, "repo_root {}\nignore_repo {}\n".format(home / "code", old))
+    out = run_core(tmp_path, "brief", path_prefix=stub(tmp_path, "tmutil", NO_TM)).stdout
+    assert "old-job" not in out and "mine" in out
