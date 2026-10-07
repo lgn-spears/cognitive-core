@@ -90,7 +90,7 @@ def ask(tmp_path, text):
 
 
 NOTES = {"reference_timesfm.md": "description: TimesFM is a timeseries foundation model from Google\n",
-         "project_av_chain.md": "description: church streaming setup with an ATEM switcher\n"}
+         "project_av_chain.md": "description: studio streaming setup with a Vexo switcher\n"}
 
 
 def test_reindex_builds_and_is_incremental(server, tmp_path):
@@ -125,7 +125,7 @@ def test_server_down_falls_back_to_words_quickly(server, tmp_path):
     core(tmp_path, "recall", "--reindex")
     Fake.down = True
     start = time.time()
-    out = ask(tmp_path, "the ATEM switcher setup")
+    out = ask(tmp_path, "the Vexo switcher setup")
     assert time.time() - start < 3 and "project_av_chain.md" in out
 
 
@@ -134,7 +134,7 @@ def test_slow_server_times_out_and_falls_back(server, tmp_path):
     core(tmp_path, "recall", "--reindex")
     Fake.delay = 5
     start = time.time()
-    r = core(tmp_path, "recall", stdin=json.dumps({"prompt": "the ATEM switcher setup"}))
+    r = core(tmp_path, "recall", stdin=json.dumps({"prompt": "the Vexo switcher setup"}))
     assert r.returncode == 0 and time.time() - start < 3
 
 
@@ -259,7 +259,7 @@ def test_trickling_or_unresolvable_server_is_bounded(server, tmp_path):
     conf = tmp_path / "corehome" / "recall.conf"
     conf.write_text(conf.read_text().replace(server, "http://no-such-host.invalid:11434"))
     start = time.time()
-    r = core(tmp_path, "recall", stdin=json.dumps({"prompt": "the ATEM switcher setup"}))
+    r = core(tmp_path, "recall", stdin=json.dumps({"prompt": "the Vexo switcher setup"}))
     assert r.returncode == 0 and time.time() - start < 2.5
 
 
@@ -302,7 +302,7 @@ def test_zero_vectors_fall_back_to_words(server, tmp_path):
     real = fake_vec
     globals()["fake_vec"] = lambda t: [0.0] * DIM
     try:
-        out = ask(tmp_path, "the ATEM switcher setup")
+        out = ask(tmp_path, "the Vexo switcher setup")
     finally:
         globals()["fake_vec"] = real
     assert "project_av_chain.md" in out
@@ -354,7 +354,7 @@ def test_fifo_index_never_hangs_the_session(server, tmp_path):
     os.mkfifo(str(index_files(tmp_path)))
     start = time.time()
     assert core(tmp_path, "inject").returncode == 0
-    assert core(tmp_path, "recall", stdin=json.dumps({"prompt": "the ATEM switcher"})).returncode == 0
+    assert core(tmp_path, "recall", stdin=json.dumps({"prompt": "the Vexo switcher"})).returncode == 0
     assert time.time() - start < 5
 
 

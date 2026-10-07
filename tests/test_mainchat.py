@@ -55,11 +55,11 @@ def test_recall_prefers_rare_terms(tmp_path):
     # A line with the specific words beats a line with only common ones.
     mem = tmp_path / "mem"
     filler = "".join("the project slides line {}\n".format(i) for i in range(40))  # 2 common terms each
-    write_mem(mem, "a.md", filler + "the sermon slides use 1920x1152 for the LED wall\n")
+    write_mem(mem, "a.md", filler + "the demo slides use 1600x900 for the lobby display\n")
     conf(tmp_path, mem)
-    r = run_core(tmp_path, "recall", stdin=prompt("project sermon slides LED wall size"))
+    r = run_core(tmp_path, "recall", stdin=prompt("project demo slides lobby display size"))
     first = [l for l in r.stdout.splitlines() if l.startswith("  ")][0]
-    assert "LED wall" in first
+    assert "lobby display" in first
 
 
 def test_recall_requires_two_matching_terms(tmp_path):

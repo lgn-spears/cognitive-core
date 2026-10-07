@@ -18,6 +18,7 @@ decisions log that preserves WHY, and open loops that resurface until done.
     core heartbeat           alarms for expected passes that never ran / failed / hung / overdue
     core brief               what needs you right now (read-only audits)
     core home                the first screen: waiting on you, noticed, done today, job health
+    core serve               the home screen as a private phone page (Tailscale or this Mac only)
     core overnight           granted jobs from overnight.conf, checked legs, one morning report
     core skill [undo ID]     skill patches offered from corrections (applied only by `core offer yes`)
     core close               silently mark activity (stop hooks)
@@ -39,6 +40,7 @@ import operator
 import os
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -561,17 +563,23 @@ def regular_files(paths):
     return [p for p in paths if p.is_file()]
 
 
+def recall_memory_dirs():
+    """The person's curated memory directories: `memory_dir` lines, else every Claude Code project memory."""
+    dirs = [Path(os.path.expanduser(v)) for v in recall_conf_values("memory_dir")]
+    return dirs or sorted(Path.home().glob(".claude/projects/*/memory"))
+
+
 def recall_sources():
     files = regular_files(home_dir() / name for name in ("CORE.md", "decisions.log", "loops.md"))
     days = home_dir() / "days"
     if days.is_dir():
         files.extend(regular_files(sorted(days.glob("*.log"))))
-    dirs = [Path(os.path.expanduser(v)) for v in recall_conf_values("memory_dir")]
-    if not dirs:
-        dirs = sorted(Path.home().glob(".claude/projects/*/memory"))
-    for d in dirs:
+    for d in recall_memory_dirs():
         if d.is_dir():
             files.extend(regular_files(sorted(d.glob("*.md"))))
+    learned = learn_file()  # what core learned without asking: searched like any memory file, never twice
+    if learned.is_file() and not any(f.resolve() == learned.resolve() for f in files):
+        files.append(learned)
     return files
 
 
@@ -1617,6 +1625,564 @@ def judge_novelty(item, related, model, url, api):
     return "new", None
 
 
+# ---- learning silently, with undo (`learn_mode auto`) ----
+#
+# The sweep's gates (the person's verbatim words, no maybes or questions, the extractor's own traps, the statement
+# and quote filters, the durability test, the novelty judge) decide what is worth keeping. In `learn_mode auto` an
+# item that passes them all AND that the judge calls durable is written to core's own learned memory
+# (`learn_file`, default ~/.core/learned.md) instead of becoming an offer. Every entry keeps the person's quote and
+# a stable id; `core learned undo <id>` takes it back, and the same words are never learned again. A person-curated
+# memory file is never edited: a correction to one is saved here, marked "supersedes <file>:<line>". Silence is
+# never permission: learned lines are evidence for recall, nothing more, and a save is never an "accepted" answer.
+
+LEARN_PER_DAY = 10          # auto-saves per day; the rest wait in the sweep queue for tomorrow
+LEARN_BUDGET_KB = 24        # learned memory's size budget; over it, the evening offers a consolidation
+LEARN_STRICT_UNDONE = 3     # undos of one type before it can go back to asking first...
+LEARN_STRICT_RATE = 0.3     # ...when at least this share of its saves were undone
+LEARN_KEPT_DAYS = 7         # a save still standing after this long is a soft positive (stats only)
+LEARN_QUOTE_CHARS = 200
+LEARNED_HEADER = ("# Learned\n\nSaved without asking, from your own words in past conversations (learn_mode auto). "
+                  "Each line keeps what you said, when, where, and an id. Undo one: core learned undo <id>. These are "
+                  "notes about the person, never permissions. Core never edits your other memory files.\n")
+LEARNED_LINE_RE = re.compile(r'^- (?P<stmt>.+?) — they said "(?P<quote>.*)" · (?P<at>\d{4}-\d\d-\d\d \d\d:\d\d) · '
+                             r'(?P<where>[^·]*?) · (?P<type>[a-z]+)(?: · supersedes (?P<sup>[^·]+?))? · '
+                             r'id:(?P<id>[0-9a-f]{12})$')
+LEARN_JUDGE_PROMPT = """A memory assistant may save one new item about a person WITHOUT asking them. Here are the most
+related lines already in memory:
+{lines}
+
+New item: {statement}
+The person's words: "{quote}"
+
+1. verdict: "known" (memory already says this), "new" (not in memory), "updates" (it clearly replaces one of the
+   lines: the person corrected it or it changed), or "conflicts" (it contradicts one of the lines and you can't tell
+   which holds now). For "updates" and "conflicts" give that line's number in "replaces".
+2. durable: would a session on a DIFFERENT task, weeks from now, be better for knowing it? A standing rule, a
+   preference, a lasting fact or decision is durable (true). A fix to the work in progress ("make this headline one
+   line"), a one-off request, or a passing mood is not (false). If you genuinely can't tell, "unsure".
+3. stakes: "high" if acting on it wrongly would matter a lot (money, people, deadlines, safety, something hard to
+   undo), else "low".
+Reply with only a JSON object: {{"verdict": "known" | "new" | "updates" | "conflicts", "replaces": <number or 0>,
+"durable": true | false | "unsure", "stakes": "high" | "low"}}"""
+
+
+def learn_mode() -> str:
+    """'auto' only when recall.conf says `learn_mode auto`; anything else (or nothing) is the conservative 'ask'."""
+    return "auto" if (recall_conf_values("learn_mode") or ["ask"])[-1].strip().lower() == "auto" else "ask"
+
+
+def learn_file() -> Path:
+    v = recall_conf_values("learn_file")
+    return Path(os.path.expanduser(v[-1])) if v else home_dir() / "learned.md"
+
+
+class LearnFileRefused(Exception):
+    pass
+
+
+def learn_file_refusal() -> str:
+    """Why learn_file can't be written, or ''. Core writes only its own file: never one inside a memory directory
+    recall reads (the person's curated notes, a new file there included) nor one of core's own curated files."""
+    f = learn_file()
+    try:
+        rf = f.resolve()
+    except (OSError, RuntimeError):
+        return "learn_file {} can't be resolved".format(f)
+    for d in recall_memory_dirs():
+        try:
+            rd = d.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if rf == rd or rd in rf.parents:
+            return ("learn_file {} is inside the memory directory {}: those are your own curated notes, and core "
+                    "never writes there. Point learn_file somewhere else (the default is ~/.core/learned.md)."
+                    .format(display_path(f), display_path(d)))
+    for name in ("CORE.md", "decisions.log", "loops.md"):
+        with contextlib.suppress(OSError, RuntimeError):
+            if rf == (home_dir() / name).resolve():
+                return "learn_file {} is one of core's own files; point it somewhere else".format(display_path(f))
+    return ""
+
+
+def learn_log_path() -> Path:
+    return home_dir() / "learned-log.jsonl"
+
+
+def conf_int(key, default) -> int:
+    for v in reversed(recall_conf_values(key)):
+        try:
+            return max(0, int(v))
+        except ValueError:
+            continue
+    return default
+
+
+def learn_key_id(key: str) -> str:
+    """The stable id of a learned entry: the hash part of its sweep key (type + the person's words)."""
+    return key.split(":", 1)[-1]
+
+
+def read_learn_log():
+    rows = []
+    try:
+        fh = open(str(learn_log_path()), errors="replace")
+    except OSError:
+        return rows
+    with fh:
+        for l in fh:
+            try:
+                r = json.loads(l)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("event") in ("saved", "undone") and isinstance(r.get("id"), str):
+                rows.append(r)
+    return rows
+
+
+def _learn_log(rec) -> None:
+    ensure_home()
+    fd = os.open(str(learn_log_path()), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)  # the person's words: private
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+
+
+def _learn_outcome(event, rec) -> None:
+    """A learning-signal row next to the offer answers. Source 'learned', outcome 'saved' / 'undone': never
+    'accepted', so a silent save can never count toward a standing-permission proposal."""
+    row = {"at": now().isoformat(timespec="seconds"), "id": rec["id"], "key": rec.get("key"), "source": "learned",
+           "outcome": event, "tags": {"type": rec.get("type", ""), "v": rec.get("v", "")},
+           "text": one_line(rec.get("statement", ""), 300)}
+    fd = os.open(str(outcomes_path()), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def learned_entries(path=None):
+    """Entries in learned memory as written now (hand edits included): [{line_no, line, stmt, quote, at, where,
+    type, sup, id}], file order. Lines that aren't entries (headers, notes the person added) are ignored."""
+    try:
+        lines = (path or learn_file()).read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for n, line in enumerate(lines, 1):
+        m = LEARNED_LINE_RE.match(line)
+        if m:
+            out.append(dict(m.groupdict(), line_no=n, line=line))
+    return out
+
+
+def learned_today(day=None) -> int:
+    day = day or now().strftime("%Y-%m-%d")
+    return sum(1 for r in read_learn_log() if r["event"] == "saved" and str(r.get("at", ""))[:10] == day)
+
+
+def learned_where(path, line) -> str:
+    """'myapp 3f2a9c1b:42': the project the words were said in, and the session prefix + transcript line."""
+    p = Path(str(path))
+    rec = transcript_record(p, int(line)) if p.is_file() else {}
+    cwd = rec.get("cwd") if isinstance(rec.get("cwd"), str) and rec.get("cwd") else None
+    home = str(Path.home())
+    project = project_from_cwd(cwd, home) if cwd else project_from_folder(p.parent.name, home) if p.parent.name else ""
+    project = re.sub(r"[^\w.-]+", "-", project).strip("-") or "general"
+    return "{} {}:{}".format(project, p.stem[:8], line)
+
+
+def _write_learned(lines) -> None:
+    f = learn_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(f.parent), prefix=".learned-")
+    with os.fdopen(fd, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, str(f))
+
+
+def learn_save(it, path, target=None, migrated=False) -> str:
+    """Write one gated, judged-durable item to learned memory. Returns its id, or '' when these words were learned
+    (or undone) before. target = the (file, line, text) the judge said it updates: a line of learned memory is
+    replaced (its old text kept in the log for undo); a line anywhere else is never touched — the entry says
+    'supersedes <file>:<line>' instead."""
+    refusal = learn_file_refusal()
+    if refusal:
+        raise LearnFileRefused(refusal)
+    key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()).hexdigest()[:12]
+    eid = learn_key_id(key)
+    with file_lock(home_dir() / "learned.lock"):
+        if any(r["id"] == eid for r in read_learn_log()):
+            return ""  # learned before (or learned and undone): never again
+        f = learn_file()
+        try:
+            lines = f.read_text(errors="replace").splitlines()
+        except OSError:
+            lines = LEARNED_HEADER.split("\n")  # the header, then a blank line before the first entry
+        stmt = one_line(it["statement"], STATEMENT_MAX)
+        quote = one_line(it["quote"], LEARN_QUOTE_CHARS)
+        rec = {"at": now().isoformat(timespec="seconds"), "event": "saved", "id": eid, "key": key,
+               "type": it["type"], "statement": stmt, "quote": quote, "path": str(path), "line": it.get("line"),
+               "v": SWEEP_VERSION}
+        meta = [now().strftime("%Y-%m-%d %H:%M"), learned_where(path, it.get("line") or 0), it["type"]]
+        idx = None
+        if target:
+            tf, tn, ttext = target
+            same = False
+            with contextlib.suppress(OSError):
+                same = Path(str(tf)).resolve() == f.resolve()
+            if same and 1 <= tn <= len(lines) and LEARNED_LINE_RE.match(lines[tn - 1]):
+                idx = tn - 1
+                rec["replaced"] = lines[idx]
+            elif not same:
+                rec["supersedes"] = "{}:{}".format(display_path(Path(str(tf))), tn)
+                rec["was"] = one_line(ttext, 200)
+                meta.append("supersedes " + rec["supersedes"].replace("·", "-"))
+        meta.append("id:" + eid)
+        line = '- {} — they said "{}" · {}'.format(stmt, quote, " · ".join(meta))
+        if idx is None:
+            lines.append(line)
+        else:
+            lines[idx] = line
+        rec["written"] = line  # undo puts `replaced` back only while this exact line still stands
+        if migrated:
+            rec["migrated"] = True
+        _write_learned(lines)
+        _learn_log(rec)
+        _learn_outcome("saved", rec)
+    return eid
+
+
+def learn_undo(fragment):
+    """(ok, message). Removes the entry, or puts back the line it replaced; the person-curated file it superseded
+    was never changed, so there is nothing to restore there. Logged as 'undone': a negative signal for its type."""
+    frag = (fragment or "").strip().lower()
+    refusal = learn_file_refusal()
+    if refusal:
+        return False, refusal
+    if not re.match(r"^[0-9a-f]{4,12}$", frag):
+        return False, "no learned entry {!r} (`core learned` lists them)".format(fragment)
+    with file_lock(home_dir() / "learned.lock"):
+        cur = [e for e in learned_entries() if e["id"].startswith(frag)]
+        if len(cur) > 1:
+            return False, "{} matches {} entries; use more of the id".format(frag, len(cur))
+        if not cur:
+            return False, "no learned entry {} in {} (already undone, or edited by hand)".format(
+                frag, display_path(learn_file()))
+        e = cur[0]
+        saved = [r for r in read_learn_log() if r["event"] == "saved" and r["id"] == e["id"]]
+        rec = saved[-1] if saved else {"id": e["id"], "type": e["type"], "statement": e["stmt"]}
+        lines = learn_file().read_text(errors="replace").splitlines()
+        old = rec.get("replaced")
+        if old and rec.get("written") != e["line"]:
+            old = None  # rewritten since (a consolidation merged it): the line it replaced is stale, never restored
+        m = LEARNED_LINE_RE.match(old or "")
+        if m and any(x["id"] == m.group("id") for x in learned_entries()):
+            old = None  # that earlier entry is still here (merged back in): restoring it would duplicate it
+        if old:
+            lines[e["line_no"] - 1] = old
+        else:
+            del lines[e["line_no"] - 1]
+        _write_learned(lines)
+        undone = dict(rec, at=now().isoformat(timespec="seconds"), event="undone")
+        _learn_log(undone)
+        _learn_outcome("undone", undone)
+    return True, "undone: {}{}".format(one_line(e["stmt"], 120), " (the earlier note is back)" if old else "")
+
+
+def learn_auto_types(rows, version=None):
+    """Per type, from silent saves and undos: {saved, undone, strict}. A type undone at least LEARN_STRICT_UNDONE
+    times, and in at least LEARN_STRICT_RATE of its saves, is strict: it goes back to asking first."""
+    out = {}
+    for r in rows:
+        if r.get("source") != "learned":
+            continue
+        tags = r.get("tags") or {}
+        t = tags.get("type")
+        if not t or (version and tags.get("v") != version):
+            continue  # undos of an older extractor don't judge the current one
+        c = out.setdefault(t, {"saved": 0, "undone": 0})
+        if r.get("outcome") in ("saved", "undone"):
+            c[r["outcome"]] += 1
+    for c in out.values():
+        c["strict"] = c["undone"] >= LEARN_STRICT_UNDONE and c["undone"] >= LEARN_STRICT_RATE * max(1, c["saved"])
+    return out
+
+
+def learn_kept(now_dt=None):
+    """Per type: entries still standing LEARN_KEPT_DAYS after they were saved. A soft signal for stats only:
+    silence is never a yes, and never permission for anything."""
+    now_dt = now_dt or now()
+    out = {}
+    for e in learned_entries():
+        try:
+            at = datetime.strptime(e["at"], "%Y-%m-%d %H:%M").replace(tzinfo=now_dt.tzinfo)
+        except ValueError:
+            continue
+        if (now_dt - at).total_seconds() >= LEARN_KEPT_DAYS * 86400:
+            out[e["type"]] = out.get(e["type"], 0) + 1
+    return out
+
+
+def judge_learn(item, related, model, url, api):
+    """(verdict, target, durable, high_stakes), or None when the judge couldn't be asked or answered nonsense (the
+    item then waits for another run: nothing is saved on a guess). durable is True only when the judge said so,
+    'unsure' when it said it can't tell, else False."""
+    lines = "\n".join("{}. {}".format(i, one_line(t, 240)) for i, (_, _, t) in enumerate(related, 1)) or "(none)"
+    try:
+        v = model_json(LEARN_JUDGE_PROMPT.format(lines=lines, statement=item["statement"],
+                                                 quote=one_line(item["quote"], LEARN_QUOTE_CHARS)),
+                       model, url, api=api, timeout=180)
+    except Exception:
+        return None
+    verdict = v.get("verdict") if isinstance(v, dict) else None
+    if verdict not in ("known", "new", "updates", "conflicts"):
+        return None
+    target = None
+    if verdict in ("updates", "conflicts"):
+        n = v.get("replaces")
+        if isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= len(related):
+            target = related[n - 1]
+        else:
+            verdict = "new"
+    durable = True if v.get("durable") is True else "unsure" if v.get("durable") == "unsure" else False
+    return verdict, target, durable, v.get("stakes") == "high"
+
+
+MEMORY_QUESTIONS_PER_DAY = 1  # in auto mode, at most one memory question a day, across every producer
+
+
+def learn_question_kind(verdict, target, durable, high):
+    """In auto mode, the only memory items worth a question — the ones core genuinely can't decide alone:
+    'supersede' (a correction to one of the person's own curated notes), 'conflict' (two of their statements
+    disagree and it's unclear which holds now), 'uncertain' (the judge can't tell if it's durable AND it would
+    matter a lot if wrong). '' for everything else: saved with Undo, or dropped."""
+    if verdict == "known" or durable is False:
+        return ""
+    if verdict == "conflicts" and target:
+        return "conflict"
+    if verdict == "updates" and target and not _is_learn_file(target[0]):
+        return "supersede"
+    if durable == "unsure":
+        return "uncertain" if high else ""
+    return ""
+
+
+def _is_learn_file(path) -> bool:
+    try:
+        return Path(str(path)).resolve() == learn_file().resolve()
+    except OSError:
+        return False
+
+
+def memory_questions_today(today=None) -> int:
+    today = today or now().strftime("%Y-%m-%d")
+    return sum(1 for it in read_inbox() if (it.get("tags") or {}).get("question") and item_origin(it) == "internal"
+               and str(it.get("at", ""))[:10] == today)
+
+
+def memory_question_ok() -> bool:
+    """Room for today's one memory question, and room in the shared daily ask budget (it is never held)."""
+    return memory_questions_today() < MEMORY_QUESTIONS_PER_DAY and asks_today() < ask_cap()
+
+
+def _said_day(path, line) -> str:
+    """'on Friday', 'today', 'on Sep 21': when the person said it, from the transcript line itself."""
+    rec = transcript_record(Path(str(path)), int(line or 0)) if Path(str(path)).is_file() else {}
+    ts = rec.get("timestamp") if isinstance(rec.get("timestamp"), str) else None
+    dt = parse_time(ts.replace("Z", "+00:00")) if ts else None
+    if not dt:
+        return ""
+    n = now()
+    dt = dt.astimezone(n.tzinfo)
+    days = (n.date() - dt.date()).days
+    if days == 0:
+        return " today"
+    if days == 1:
+        return " yesterday"
+    return " on " + (dt.strftime("%A") if 0 < days < 7 else "{} {}".format(dt.strftime("%b"), dt.day))
+
+
+def memory_question_text(kind, it, path, target) -> str:
+    said = '“{}”'.format(one_line(it["quote"], 110).rstrip(". "))
+    day = _said_day(path, it.get("line"))
+    if kind in ("supersede", "conflict") and target:
+        old = target[2]
+        m = LEARNED_LINE_RE.match(old.strip())
+        if m:  # a learned line: what they said then, in their words
+            other = 'earlier you said “{}”'.format(one_line(m.group("quote"), 90).rstrip(". "))
+        else:
+            other = 'your notes say “{}”'.format(one_line(re.sub(r"^\s*[-*#]+\s*", "", old), 90).rstrip(". "))
+        return "Quick one: you said {}{}, but {}. Which is right now?".format(said, day, other)
+    return "Quick one: you said {}{}. Should I remember this for next time: {}".format(
+        said, day, one_line(you_voice(it["statement"]), 140))
+
+
+def memory_question(kind, it, path, target, key) -> str:
+    """Put the day's one memory question to the person. A yes saves it exactly as a silent save would (core does
+    the write: the agent never saves it by hand); a no drops it for good."""
+    payload = {"item": {k: it.get(k) for k in ("type", "statement", "quote", "line")}, "path": str(path),
+               "target": [str(target[0]), target[1], target[2]] if target else None}
+    return deliver_item(memory_question_text(kind, it, path, target), "sweep", key, skip_if_acked=True, offer=True,
+                        tags={"type": it["type"], "v": SWEEP_VERSION, "question": kind,
+                              "learn": json.dumps(payload)}, _internal=True)
+
+
+def answer_memory_question(cur) -> str:
+    """After a yes to core's own memory question: save it to learned memory. Returns a line for the person."""
+    try:
+        payload = json.loads((cur.get("tags") or {}).get("learn") or "{}")
+        it, path = payload["item"], payload["path"]
+        t = payload.get("target")
+        target = (Path(t[0]), int(t[1]), str(t[2])) if t else None
+    except (ValueError, KeyError, TypeError, IndexError):
+        return "nothing saved: the question's details couldn't be read"
+    if not all(isinstance(it.get(k), str) for k in ("type", "statement", "quote")):
+        return "nothing saved: the question's details couldn't be read"
+    try:
+        eid = learn_save(it, path, target)
+    except LearnFileRefused as e:
+        return "nothing saved: " + str(e)
+    return "saved to learned memory: {} (undo: core learned undo {})".format(one_line(it["statement"], 100), eid[:8]) \
+        if eid else "already in learned memory"
+
+
+def logged_sweep_items():
+    """sweep key -> (item, transcript path) for every gated item in the sweep log: the full statement and quote of
+    an offer whose inbox text was shortened to fit."""
+    out = {}
+    for name in ("sweep.log.1", "sweep.log"):
+        try:
+            fh = open(str(home_dir() / name), errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for l in fh:
+                try:
+                    rec = json.loads(l)
+                except ValueError:
+                    continue
+                for it in (rec.get("items") or []) if isinstance(rec, dict) else []:
+                    if isinstance(it, dict) and it.get("type") in SWEEP_TYPES and isinstance(it.get("quote"), str):
+                        key = "sweep:" + hashlib.sha1("{}\n{}".format(it["type"], _squash(it["quote"])).encode()
+                                                      ).hexdigest()[:12]
+                        out[key] = (it, rec.get("path", ""))
+    return out
+
+
+def verified_at_line(item, path):
+    """The item as sweep_gate keeps it, from the person's own turn at the line it cites, or None: the quote must be
+    there verbatim (up to spacing/case) and pass every gate a freshly extracted item would."""
+    try:
+        turns = [t for t in transcript_turns(Path(str(path))) if t[0] == item["line"] and t[1] == "user"]
+    except Exception:
+        return None
+    if not turns or not _squash(item["quote"]) or _squash(item["quote"]) not in _squash(turns[0][2]):
+        return None
+    kept = sweep_gate([item], turns)
+    return kept[0] if kept and kept[0]["line"] == item["line"] else None
+
+
+def learn_migrate(model, url, api, start, budget, strict_types):
+    """auto mode: memory offers still waiting on the person are judged again under the new rules. Durable →
+    learned (the offer leaves the inbox, its entry shows under What I Learned with Undo); a one-off or something
+    already known → quietly retired as 'superseded' (not a no: no outcome is logged). Insights, permissions and
+    skill patches stay offers. Returns (judged, learned)."""
+    todo = [it for it in read_inbox() if it["source"] == "sweep" and item_origin(it) == "internal"
+            and it.get("kind") == "offer" and it["status"] in ("pending", "waiting")
+            and set(it.get("tags") or {}) <= {"type", "v"}  # plain memory offers only: no grant, patch or question
+            and (it.get("tags") or {}).get("type") in SWEEP_TYPES
+            and (it.get("tags") or {}).get("type") not in strict_types]
+    if not todo:
+        return 0, 0
+    logged, cache, judged, learned = logged_sweep_items(), {}, 0, 0
+    cap = conf_int("learn_per_day", LEARN_PER_DAY)
+    for it in todo:
+        if judged >= budget or time.monotonic() - start > SWEEP_DEADLINE:
+            break
+        found = logged.get(it["key"])
+        if found:
+            item, path = dict(found[0]), found[1]
+        else:
+            m = SWEEP_PAGE_RE.match(it["text"])
+            path = find_transcript(m.group("sess"), cache) if m else None
+            item = verified_at_line({"type": it["tags"]["type"], "statement": m.group("stmt"),
+                                     "quote": m.group("quote"), "line": int(m.group("line"))}, path) if path else None
+            if not item:
+                continue  # the offer's own text is all there is, and the transcript doesn't bear it out: it stays asked
+        if not path or not Path(str(path)).is_file() or is_headless(transcript_entrypoint(Path(str(path)))):
+            continue  # an agent's brief (or words core can't find) is never saved without asking
+        judged += 1
+        res = judge_learn(item, related_memory(item["statement"]), model, url, api)
+        _sweep_log({"at": now().isoformat(timespec="seconds"), "rejudged": it["id"], "statement": item["statement"],
+                    "verdict": [res[0], res[2]] if res else None})
+        if res is None:
+            continue  # the judge couldn't answer: it stays an offer until a run where it can
+        verdict, target, durable = res[:3]
+        if durable == "unsure":
+            continue  # it can't decide alone: it stays the question it already is
+        keep = durable is True and verdict != "known"
+        if keep and learned_today() >= cap:
+            continue  # today's silent saves are used up: it waits (still an offer) for tomorrow
+        eid = learn_save(item, path, target if verdict in ("updates", "conflicts") else None, migrated=True) if keep else ""
+        with inbox_lock():
+            cur = read_item(inbox_dir() / (it["id"] + ".json"))
+            if not cur or cur["status"] not in ("pending", "waiting"):
+                continue  # answered meanwhile: the person's answer stands
+            if keep:
+                cur.update(status="learned", learned_id=eid or learn_key_id(it["key"]))
+                learned += 1 if eid else 0
+            else:
+                cur.update(status="superseded", superseded_why="one-off" if not durable else "already known")
+            cur["superseded_at"] = now().isoformat(timespec="seconds")
+            write_item(cur)
+    return judged, learned
+
+
+def learn_consolidate_offer():
+    """Evening: when learned memory is over its budget, ask (once a month at most) whether to consolidate it.
+    An offer, never done silently: it rewrites what was learned."""
+    f = learn_file()
+    try:
+        size = f.stat().st_size
+    except OSError:
+        return None
+    budget = conf_int("learn_budget_kb", LEARN_BUDGET_KB) * 1024
+    if not budget or size <= budget:
+        return None
+    n = len(learned_entries(f))
+    text = ("Consolidation offer (only on an explicit yes): what I learned has grown to {} KB, over its {} KB budget "
+            "({} entries). On a yes, merge entries that say the same thing and drop ones that no longer hold, keeping "
+            "each kept entry's quote, date and id, so recall stays sharp.".format(
+                (size + 1023) // 1024, budget // 1024, n))
+    return deliver_item(text, "evening", "learned:consolidate:" + now().strftime("%Y-%m"), offer=True,
+                        tags={"type": "consolidate"}, _internal=True)
+
+
+def cmd_learned(args) -> int:
+    if args.learned_cmd == "undo":
+        if not args.learned_id:
+            print("usage: core learned undo <id>", file=sys.stderr)
+            return 2
+        ok, msg = learn_undo(args.learned_id)
+        print(msg if ok else "core learned: " + msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+    es = learned_entries()
+    if args.since:
+        if not re.match(r"^\d{4}-\d\d-\d\d$", args.since):
+            print("core learned: --since takes YYYY-MM-DD", file=sys.stderr)
+            return 2
+        es = [e for e in es if e["at"][:10] >= args.since]
+    if not es:
+        print("nothing learned{}{}".format(" since " + args.since if args.since else "",
+                                            "" if learn_mode() == "auto" else " (learn_mode is ask: set learn_mode "
+                                            "auto in recall.conf to learn without asking)"))
+        return 0
+    for e in sorted(es, key=lambda e: (e["at"], e["line_no"]), reverse=True):
+        print("{}  {} · {} · {}".format(e["id"], e["at"], e["type"], e["where"]))
+        print("    {}".format(e["stmt"]))
+        print('    they said "{}"{}'.format(e["quote"], " · supersedes " + e["sup"] if e["sup"] else ""))
+        print("    undo: core learned undo {}".format(e["id"][:8]))
+    print("{} in {}".format(len(es), display_path(learn_file())))
+    return 0
+
+
 def _load_sweep_state():
     try:
         st = json.loads(sweep_state_path().read_text())
@@ -1671,12 +2237,16 @@ def cmd_sweep(args) -> int:
 
 def sweep_pass() -> int:
     """Read conversations that have gone quiet, extract what's worth remembering, and OFFER it via the
-    inbox. Never writes memory itself. Bounded per run (chunks, deadline); progress is saved per chunk.
+    inbox — or, with `learn_mode auto`, save what the judge calls durable to core's own learned memory (never to
+    the person's files; see learn_save). Bounded per run (chunks, deadline); progress is saved per chunk.
     Exit 1 when a chunk failed (the heartbeat alarms); it is retried, and skipped after SWEEP_MAX_TRIES."""
     model, url, api = sweep_config()
     if not model:
         print("core sweep: set `sweep_model <model>` in ~/.core/recall.conf first "
               "(e.g. sweep_model qwen3:8b)", file=sys.stderr)
+        return 2
+    if learn_mode() == "auto" and learn_file_refusal():
+        print("core sweep: " + learn_file_refusal(), file=sys.stderr)
         return 2
     conf = lambda k, d: (recall_conf_values(k) or [d])[-1]
     flag = lambda k, d: conf(k, d).lower() in ("on", "yes", "true", "1")
@@ -1774,17 +2344,26 @@ def sweep_pass() -> int:
             _save_sweep_state(state)
         if first_run and not sweep_state_path().exists():
             _save_sweep_state(state)
-        offered = 0
+        offered = n_learned = 0
+        auto = learn_mode() == "auto"
         if not shadow and not outage:
             cap = ask_cap()  # one daily budget shared with every other producer (evening, grants, deliver --offer)
+            # auto: a type the person keeps undoing goes back to asking first
+            strict = {t for t, c in learn_auto_types(read_outcomes(), version=SWEEP_VERSION).items() if c["strict"]}
             learned = learn_offer_types(read_outcomes(), version=SWEEP_VERSION)
             score = lambda t: learned.get(t, {}).get("score", 0.5)
             queue = sorted(state["queue"], key=lambda q: (-score(q["item"].get("type")),
                                                           OFFER_PRIORITY.get(q["item"].get("type"), 9)))
             skill_offer_pass(state, model, url, api, start, offer_types)  # one open at a time, before memory offers
             queue = [q for q in queue if any(q is x for x in state["queue"])]
-            existing = {it.get("key") for it in read_inbox()}
             judged, keep = 0, []
+            if auto:  # offers made before auto was on are judged again under the new rules
+                judged, n_learned = learn_migrate(model, url, api, start, SWEEP_MAX_JUDGE, strict)
+            existing = {it.get("key") for it in read_inbox()}
+            learn_cap = conf_int("learn_per_day", LEARN_PER_DAY)
+            # `sweep_headless on`: a headless run's "user" turns are an agent's brief, so its items are only ever asked
+            heads = {}
+            headless_run = lambda p: heads.setdefault(str(p), is_headless(transcript_entrypoint(p)))
             for q in queue:
                 it, p = q["item"], Path(q["path"])
                 if q.get("skill"):
@@ -1798,6 +2377,36 @@ def sweep_pass() -> int:
                     continue  # already offered (pending or answered): never twice
                 if learned.get(it["type"], {}).get("paused"):
                     continue  # the person keeps declining this kind of offer
+                if auto and it["type"] not in strict and not headless_run(p):  # learn it without asking, or not at all
+                    if any(r["id"] == learn_key_id(key) for r in read_learn_log()):
+                        continue  # learned before, or learned and undone: never again
+                    if learned_today() >= learn_cap:
+                        keep.append(q)  # today's silent saves are used up: tomorrow
+                        continue
+                    judged += 1
+                    res = judge_learn(it, related_memory(it["statement"]), model, url, api)
+                    _sweep_log({"at": now().isoformat(timespec="seconds"), "judged": it["statement"], "mode": "auto",
+                                "verdict": res[0] if res else None, "durable": res[2] if res else None,
+                                "high": res[3] if res else None,
+                                "target": "{}:{}".format(res[1][0], res[1][1]) if res and res[1] else None})
+                    if res is None:
+                        keep.append(q)  # the judge couldn't answer: nothing is saved on a guess; next run
+                        continue
+                    verdict, target, durable, high = res
+                    question = learn_question_kind(verdict, target, durable, high)
+                    if question and memory_question_ok():
+                        memory_question(question, it, p, target, key)  # the one memory question today
+                        existing.add(key)
+                        offered += 1
+                    elif question in ("conflict", "uncertain"):
+                        keep.append(q)  # it can't decide alone and today's question is used: tomorrow
+                        continue
+                    elif verdict != "known" and durable is True and learn_save(
+                            it, p, target if verdict in ("updates", "conflicts") else None):
+                        n_learned += 1  # (a correction to a curated note, without a question: saved as superseding)
+                    state["queue"] = [x for x in state["queue"] if x is not q]
+                    _save_sweep_state(state)
+                    continue
                 if "sweep:" + it["type"] not in read_grants() and asks_today() >= cap:
                     keep.append(q)  # a question waits for tomorrow; a pre-approved item asks nothing, so it goes on
                     continue
@@ -1827,7 +2436,8 @@ def sweep_pass() -> int:
             print("sweep (shadow — logged to {}, nothing offered): {} item(s){}".format(
                 display_path(home_dir() / "sweep.log"), kept_total, tail))
         else:
-            print("sweep: {} offer(s) of {} item(s){}".format(offered, kept_total, tail))
+            print("sweep: {} offer(s) of {} item(s){}{}".format(
+                offered, kept_total, ", {} learned".format(n_learned) if auto else "", tail))
         return 1 if failed else 0
 
 
@@ -2947,6 +3557,7 @@ def cmd_evening(args) -> int:
             if it["key"].startswith("evening:") and it["key"] != "evening:" + today:
                 resolve_items(it["key"])
     deliver_item(evening_wrap(today), "evening", "evening:" + today, replace=True, _internal=True)
+    learn_consolidate_offer()  # an offer, only when learned memory is over its budget (at most once a month)
     found, status = evening_insight(today, evening_context(today))
     held = repeat = False
     if found:
@@ -3270,8 +3881,8 @@ def render_inbox(items, limit=INBOX_SHOW, full=False):
 # words core uses to say something is pre-approved. Items record their origin; a key is shared (replace, upgrade
 # to an offer, dedupe) only within one origin and source, so a CLI call can never rewrite a producer's item.
 RESERVED_SOURCES = frozenset({"sweep", "evening", "overnight", "permissions", "skill"})
-RESERVED_KEY_PREFIXES = ("grant:", "sweep:", "insight:", "evening:", "overnight:", "skill:")
-RESERVED_TAGS = ("grant", "granted", "grant_job", "cmd_sha", "v", "patch")
+RESERVED_KEY_PREFIXES = ("grant:", "sweep:", "insight:", "evening:", "overnight:", "skill:", "learned:")
+RESERVED_TAGS = ("grant", "granted", "grant_job", "cmd_sha", "v", "patch", "question", "learn")
 RESERVED_PHRASES = ("preapproved", "standingpermission", "sweepoffer", "skillpatchoffer")  # core's own leads, compared squashed
 ORIGINS = ("cli", "internal")
 
@@ -3382,7 +3993,9 @@ def deliver_item(text: str, source: str, key: str = "", replace: bool = False, s
             else:
                 item["asked"] = now_dt.strftime("%Y-%m-%d")
         write_item(item)
-        return item["id"]
+    if _internal and offer and item["status"] == "pending":
+        notify_new()  # outside the inbox lock: the doorbell never holds up a delivery
+    return item["id"]
 
 
 def resolve_items(key: str) -> None:
@@ -3475,7 +4088,7 @@ def maybe_propose_grant(item):
     if scope not in GRANTABLE_SCOPES or scope in read_grants():
         return
     yes = sum(1 for r in read_outcomes() if r.get("outcome") == "accepted" and r.get("source") == item.get("source")
-              and (r.get("tags") or {}).get("type") == t)
+              and (r.get("tags") or {}).get("type") == t and not (r.get("tags") or {}).get("question"))
     if yes < GRANT_AFTER_YES:
         return
     deliver_item("Standing permission? They've said yes to {} {} offers from {}. Ask whether to save these "
@@ -3513,8 +4126,8 @@ def learn_offer_types(rows, version=None):
     for r in rows:
         tags = r.get("tags") or {}
         t = tags.get("type")
-        if not t or (version and tags.get("v") != version):
-            continue  # answers to an older extractor don't judge the current one
+        if not t or (version and tags.get("v") != version) or tags.get("question"):
+            continue  # answers to an older extractor don't judge the current one; "which is right?" isn't a verdict
         c = out.setdefault(t, {"yes": 0, "no": 0})
         if r.get("outcome") == "accepted":
             c["yes"] += 1
@@ -3535,8 +4148,8 @@ def cmd_offer(args) -> int:
             return 0
         by = {}
         for r in rows:
-            if r.get("kind"):
-                continue  # skill patch effects, not answers (below)
+            if r.get("kind") or r.get("source") == "learned":
+                continue  # skill patch effects and silent saves, not answers (below)
             c = by.setdefault(r.get("source") or "?", {})
             c[r["outcome"]] = c.get(r["outcome"], 0) + 1
         inv = {v: k for k, v in ANSWERS.items()}
@@ -3548,6 +4161,17 @@ def cmd_offer(args) -> int:
         for t, c in sorted(learn_offer_types(rows).items(), key=lambda x: -x[1]["score"]):
             print("  {}: {} yes / {} no → score {:.2f}{}".format(t, c["yes"], c["no"], c["score"],
                                                                 " — PAUSED (keeps being declined)" if c["paused"] else ""))
+        auto = learn_auto_types(rows)
+        if auto:
+            print("learned without asking (learn_mode {}): {} saved, {} undone".format(
+                learn_mode(), sum(c["saved"] for c in auto.values()), sum(c["undone"] for c in auto.values())))
+            current = learn_auto_types(rows, version=SWEEP_VERSION)
+            for t, c in sorted(auto.items()):
+                print("  {}: {} saved / {} undone{}".format(t, c["saved"], c["undone"],
+                                                           " → asking first again (undone often)"
+                                                           if current.get(t, {}).get("strict") else ""))
+            kept = learn_kept()
+            print("  kept 7+ days: {} (a soft signal only: silence is never permission)".format(sum(kept.values())))
         eff = {}
         for r in rows:
             if r.get("kind") in ("skill-apply", "skill-use"):
@@ -3608,7 +4232,10 @@ def cmd_offer(args) -> int:
             ungrantable = _write_grant(scope, cur.get("tags") or {}, args.note.strip(), oid)
         elif tagged and outcome == "accepted":
             ungrantable = "this offer wasn't made by core itself, so a yes to it grants nothing"
-    if outcome == "accepted" and not tagged:
+    question = (cur.get("tags") or {}).get("question") if item_origin(cur) == "internal" and cur.get("source") == "sweep" else ""
+    if outcome == "accepted" and question:
+        print(answer_memory_question(cur))  # core writes it; never a step toward a standing permission
+    elif outcome == "accepted" and not tagged:
         maybe_propose_grant(cur)
     print("{}: {}{}{}".format(oid, outcome, " until " + cur["until"][:10] if outcome == "deferred" else "",
                               " (late: after the offer had expired)" if late else ""))
@@ -4222,7 +4849,40 @@ def overnight_report_today(items, now_dt):
     return max(found, key=lambda it: it["seq"]) if found else None
 
 
-def home_screen(now_dt) -> str:
+LEARN_PLURALS = {"loop": "open loops", "fact": "facts", "preference": "preferences", "correction": "corrections",
+                 "decision": "decisions"}
+
+
+def learned_recent(now_dt, days=7):
+    """Learned entries from the last `days` local days, newest first, each with its save record (for what it
+    replaced or superseded) and whether it is from today."""
+    recs = {r["id"]: r for r in read_learn_log() if r["event"] == "saved"}
+    out = []
+    for e in learned_entries():
+        try:
+            at = datetime.strptime(e["at"], "%Y-%m-%d %H:%M").replace(tzinfo=now_dt.tzinfo)
+        except ValueError:
+            continue
+        age = (now_dt.date() - at.date()).days
+        if 0 <= age < days:
+            out.append(dict(e, dt=at, today=age == 0, rec=recs.get(e["id"], {})))
+    return sorted(out, key=lambda e: (e["dt"], e["line_no"]), reverse=True)
+
+
+def learn_strict_notes():
+    """One plain line per type that went back to asking first because the person kept undoing it."""
+    notes = []
+    for t, c in sorted(learn_auto_types(read_outcomes(), version=SWEEP_VERSION).items()):
+        if c["strict"]:
+            kind = LEARN_PLURALS.get(t, t + "s")
+            notes.append("You undid {} of the {} {} I saved, so I'll ask before saving {} now.".format(
+                c["undone"], c["saved"], kind, kind))
+    return notes
+
+
+def home_data(now_dt) -> dict:
+    """Everything the first screen shows, as data: `core home` prints it, `core serve` renders it as a page.
+    Text fields are already display-filtered (display_text / display_ok); nothing here is raw producer output."""
     pending = pending_inbox()  # also applies expiries and lets held asks take free slots, like every surface
     items = read_inbox()
     offers = [it for it in pending if it.get("kind") == "offer"]
@@ -4231,24 +4891,83 @@ def home_screen(now_dt) -> str:
                      key=lambda it: -it["seq"])
     held = [it for it in items if it["status"] == "waiting"]
     alarms = safe_alarms()
+    cap = ask_cap()
+    held_note = "{} {}ask{} wait{} for tomorrow ({}).".format(
+        len(held), "more " if offers else "", "" if len(held) == 1 else "s", "s" if len(held) == 1 else "",
+        "asks_per_day is 0" if not cap else "today's 1 is used" if cap == 1 else
+        "today's {} are used".format(cap)) if held else ""
 
-    out = ["{} · {} {} · {}".format(identity_name() or "Home", now_dt.strftime("%a %b"), now_dt.day, clock(now_dt))]
+    def local_today(ts):
+        t = parse_time(ts) if isinstance(ts, str) else None
+        return t.astimezone(now_dt.tzinfo) if t and t.astimezone(now_dt.tzinfo).date() == now_dt.date() else None
+
+    done = []  # (text, ack id or "")
+    if report:  # the morning report already names every overnight job: its run records aren't repeated
+        done.append((display_text(report), report["id"] if report["status"] == "pending" else ""))
+    recs = read_heartbeats()
+    ran = [(local_today(rec.get("finished")), name, rec) for name, rec in recs.items() if rec.get("status") == "ok"
+           and not (report and (name == "overnight" or name.startswith("overnight-")))]
+    for fin, name, rec in sorted((r for r in ran if r[0]), key=lambda r: r[0]):  # failures are alarms, not "done"
+        last = one_line(str(rec.get("last_line") or ""), 120)
+        last = last if display_ok(last) else ""  # a job's own output: quoted only when it's safe to show
+        done.append(("{} finished {}{}".format(name, clock(fin), ': "{}"'.format(last) if last else ""), ""))
+    answered = [r for r in read_outcomes() if r.get("outcome") in ("accepted", "declined", "never")
+                and local_today(r.get("at"))]
+    if answered:
+        yes = sum(1 for r in answered if r["outcome"] == "accepted")
+        done.append(("You answered {} offer{} today: {} yes, {} no.".format(
+            len(answered), "" if len(answered) == 1 else "s", yes, len(answered) - yes), ""))
+
+    footer = ""
+    if not alarms:
+        expects, _ = read_expectations()
+        if not expects:
+            footer = "no background jobs to check: passes.conf expects none"
+        else:
+            parts = []
+            for name, _, _ in expects:
+                rec = recs.get(name, {})
+                parts.append("{} {}".format(name, when_label(rec.get("finished") or rec.get("started"), now_dt)))
+            footer = " · ".join(parts + ["all on time"])
+    learned = learned_recent(now_dt)
+    return {"title": identity_name() or "Home", "now": now_dt, "alarms": alarms, "offers": offers,
+            "held": len(held), "held_note": held_note, "noticed": noticed, "done": done, "footer": footer,
+            "learned": learned, "learned_today": sum(1 for e in learned if e["today"]),
+            "strict_notes": learn_strict_notes() if learn_mode() == "auto" else []}
+
+
+def home_screen(now_dt) -> str:
+    d = home_data(now_dt)
+    offers, noticed, alarms = d["offers"], d["noticed"], d["alarms"]
+    out = ["{} · {} {} · {}".format(d["title"], now_dt.strftime("%a %b"), now_dt.day, clock(now_dt))]
     for a in alarms:
         out += home_wrap(a, "! ", "  ")
     out.append("")
 
-    if offers or held:
-        cap = ask_cap()
+    if d["learned"] or d["strict_notes"]:
+        n = d["learned_today"]
+        out += ["LEARNED · {} today".format(n) if n else "LEARNED THIS WEEK", ""]
+        for e in d["learned"][:HOME_NOTICED]:
+            ok = display_ok(e["stmt"]) and display_ok(e["quote"])
+            out += home_wrap(e["stmt"] if ok else "A note I saved: core learned lists it.", " ·  ", "    ")
+            meta = [when_label(e["dt"], now_dt), e["where"].split(" ")[0],
+                    'you said "{}"'.format(one_line(e["quote"], 80)) if ok else ""]
+            out += home_wrap(" · ".join(m for m in meta if m), "    ", "    ")
+            out.append("    → undo: core learned undo {}".format(e["id"][:8]))
+        if len(d["learned"]) > HOME_NOTICED:
+            out.append(" ·  {} more: `core learned` lists them all".format(len(d["learned"]) - HOME_NOTICED))
+        for note in d["strict_notes"]:
+            out += home_wrap(note, " ·  ", "    ")
+        out.append("")
+
+    if offers or d["held"]:
         # what's waiting, however old; not today's ask count, which reads "0 asks today" above yesterday's questions
         out += ["WAITING ON YOU · {} waiting".format(len(offers)) if offers else "WAITING ON YOU", ""]
         for i, it in enumerate(offers, 1):
             out += home_wrap(display_text(it), "{:>2}  ".format(i), "    ")
             out.append("    → yes · later · no · never: core offer <answer> {}".format(short_id(it["id"])))
-        if held:
-            out.append(" ·  {} {}ask{} wait{} for tomorrow ({}).".format(
-                len(held), "more " if offers else "", "" if len(held) == 1 else "s", "s" if len(held) == 1 else "",
-                "asks_per_day is 0" if not cap else "today's 1 is used" if cap == 1 else
-                "today's {} are used".format(cap)))
+        if d["held"]:
+            out.append(" ·  " + d["held_note"])
         out.append("")
 
     if noticed:
@@ -4261,48 +4980,19 @@ def home_screen(now_dt) -> str:
             out.append(" ·  {} more: `core inbox` lists them all".format(len(noticed) - HOME_NOTICED))
         out.append("")
 
-    if not offers and not held and not noticed:
+    if not offers and not d["held"] and not noticed:
         out += ["Nothing else needs you." if alarms else "Nothing needs you.", ""]
 
-    def local_today(ts):
-        t = parse_time(ts) if isinstance(ts, str) else None
-        return t.astimezone(now_dt.tzinfo) if t and t.astimezone(now_dt.tzinfo).date() == now_dt.date() else None
-
-    done = []
-    if report:  # the morning report already names every overnight job: its run records aren't repeated
-        done.append((display_text(report), "core inbox ack " + short_id(report["id"]) if report["status"] == "pending" else ""))
-    recs = read_heartbeats()
-    ran = [(local_today(rec.get("finished")), name, rec) for name, rec in recs.items() if rec.get("status") == "ok"
-           and not (report and (name == "overnight" or name.startswith("overnight-")))]
-    for fin, name, rec in sorted((r for r in ran if r[0]), key=lambda r: r[0]):  # failures are alarms, not "done"
-        last = one_line(str(rec.get("last_line") or ""), 120)
-        last = last if display_ok(last) else ""  # a job's own output: quoted only when it's safe to show
-        done.append("{} finished {}{}".format(name, clock(fin), ': "{}"'.format(last) if last else ""))
-    answered = [r for r in read_outcomes() if r.get("outcome") in ("accepted", "declined", "never")
-                and local_today(r.get("at"))]
-    if answered:
-        yes = sum(1 for r in answered if r["outcome"] == "accepted")
-        done.append("You answered {} offer{} today: {} yes, {} no.".format(
-            len(answered), "" if len(answered) == 1 else "s", yes, len(answered) - yes))
-    if done:
+    if d["done"]:
         out += ["DONE TODAY", ""]
-        for d in done:
-            text, meta = d if isinstance(d, tuple) else (d, "")
+        for text, ack in d["done"]:
             out += home_wrap(text, " ·  ", "    ")
-            if meta:
-                out.append("    " + meta)
+            if ack:
+                out.append("    core inbox ack " + short_id(ack))
         out.append("")
 
-    if not alarms:
-        expects, _ = read_expectations()
-        if not expects:
-            out.append("no background jobs to check: passes.conf expects none")
-        else:
-            parts = []
-            for name, _, _ in expects:
-                rec = recs.get(name, {})
-                parts.append("{} {}".format(name, when_label(rec.get("finished") or rec.get("started"), now_dt)))
-            out.append(" · ".join(parts + ["all on time"]))
+    if d["footer"]:
+        out.append(d["footer"])
     elif out[-1] == "":
         out.pop()
     return "\n".join(out)
@@ -4311,6 +5001,1011 @@ def home_screen(now_dt) -> str:
 def cmd_home(args) -> int:
     print(home_screen(now()))
     return 0
+
+
+# ---- the phone page: `core serve` ----
+#
+# The home screen as a private web page for the person's phone. It listens only on this Mac's Tailscale address
+# (else loopback), never on every interface, and only answers under a secret path token. It reads the same data as
+# `core home` (home_data, display-filtered) and records answers through cmd_offer itself — same lock, same outcome
+# row. Grants and skill patches are shown but answered only on the Mac: they need the person's own words or a diff
+# review. No model, no network beyond the one socket.
+
+SERVE_PORT = 8796
+SERVE_NONCE_TTL = 12 * 3600     # a phone tab left open over a day is reloaded, not trusted
+SERVE_NONCES_MAX = 256
+SERVE_BODY_MAX = 4096
+SERVE_CONN_TIMEOUT = 3          # seconds a connection may sit idle (or trickle a body) before it is dropped
+SERVE_REBIND_CHECK = 60         # seconds between checks that the tailnet address hasn't changed
+SERVE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+NOTIFY_EVERY = 3600             # the doorbell rings at most once an hour
+TAILNET_V4 = "100.64.0.0/10"    # Tailscale's CGNAT range: the only non-loopback address core serve accepts
+
+SWEEP_PAGE_RE = re.compile(r'^Sweep offer \([^)]*\): (?:\[(?P<type>[\w -]+)\] |Update memory\? (?P<file>\S+?):(?P<n>\d+) '
+                           r'"(?P<was>.*?)" → )"(?P<stmt>.*)"; they said "(?P<quote>.*)" — (?P<sess>[\w-]+):(?P<line>\d+)$')
+SKILL_PAGE_RE = re.compile(r'^Skill patch offer \([^)]*\): (?P<name>[\w.-]+): (?P<changes>.*?) — they said '
+                           r'"(?P<quote>.*?)" \((?P<sess>[\w-]+):(?P<line>\d+)')
+INSIGHT_PAGE_RE = re.compile(r"^(?P<stmt>.*) \(from: (?P<from>.*)\)$")
+TYPE_LABELS = {"preference": "Preference", "correction": "Correction", "decision": "Decision", "fact": "Fact",
+               "loop": "Open Loop", "insight": "Insight", "skill-patch": "Skill Patch"}
+ANSWER_LABELS = {"yes": "Yes", "later": "Later", "no": "No", "never": "Never Ask Again"}
+# What each answer DOES, in words, per kind of offer (the page must explain itself without a manual).
+KIND_ANSWER_LABELS = {
+    "memory": {"yes": "Remember", "later": "Not Now", "no": "Forget", "never": "Never Ask Again"},
+    "insight": {"yes": "Helpful", "later": "Not Now", "no": "Not Useful", "never": "Never Ask Again"},
+    # auto mode's one memory question a day: one tap says which is right
+    "supersede": {"yes": "What I Said", "later": "Not Now", "no": "My Notes", "never": "Never Ask Again"},
+    "conflict": {"yes": "The Newer One", "later": "Not Now", "no": "The Earlier One", "never": "Never Ask Again"},
+    "uncertain": {"yes": "Remember", "later": "Not Now", "no": "Don’t", "never": "Never Ask Again"},
+}
+_IRREGULAR = {"is": "are", "was": "were", "has": "have", "does": "do", "doesn't": "don't"}
+
+
+def you_voice(stmt: str) -> str:
+    """'The person finds X' → 'You find X'. Statements are stored in the third person (memory notes are about
+    the person); the page speaks TO them. Only the leading subject is rewritten; anything else is untouched."""
+    m = re.match(r"^\s*the person's\s+(.*)$", stmt, re.I)
+    if m:
+        return "Your " + m.group(1)
+    m = re.match(r"^\s*the person\s+(\S+)(.*)$", stmt, re.I)
+    if not m:
+        return stmt
+    verb, rest = m.group(1), m.group(2)
+    low = verb.lower()
+    if low in _IRREGULAR:
+        verb = _IRREGULAR[low]
+    elif low.endswith("ies") and len(low) > 4:
+        verb = verb[:-3] + "y"
+    elif re.search(r"(sh|ch|x|ss|zz)es$", low):
+        verb = verb[:-2]
+    elif low.endswith("s") and not low.endswith("ss") and not low.endswith("us"):
+        verb = verb[:-1]
+    rest = re.sub(r"\b(and|but|so|or)\s+(wants|finds|prefers|thinks|expects|needs|says|likes|feels|asks|keeps|uses|"
+                  r"hates|loves|plans|hopes|believes|considers|sees|knows|goes)\b",
+                  lambda m2: m2.group(1) + " " + (m2.group(2)[:-2] if m2.group(2) in ("goes",) else m2.group(2)[:-1]),
+                  rest)
+    return "You " + verb + rest
+ANSWER_RECORDED = {"yes": "Recorded: Yes.", "no": "Recorded: No.",
+                   "later": "Recorded: Later. It comes back in {} days.".format(OFFER_DEFER_DAYS),
+                   "never": "Recorded: Never. It won't be asked again."}
+
+
+def notify_new() -> None:
+    """A new ask from one of core's own producers: run notify_cmd (recall.conf) with a content-free line such as
+    '<name>: 1 new' (the identity name, else 'core'), at most once per NOTIFY_EVERY. Asks that land inside the
+    hour are counted into the next ping.
+    The command gets the message as its last argument; never the offer's text, source or id."""
+    vals = recall_conf_values("notify_cmd")
+    if not vals or not vals[-1].strip():
+        return
+    try:
+        argv = shlex.split(vals[-1])
+    except ValueError:
+        return
+    st_path = home_dir() / "notify.json"
+    now_dt = now()
+    with file_lock(home_dir() / "notify.lock"):
+        try:
+            st = json.loads(st_path.read_text())
+            st = st if isinstance(st, dict) else {}
+        except (OSError, ValueError):
+            st = {}
+        unsent = st.get("unsent") if isinstance(st.get("unsent"), int) else 0
+        last = parse_time(st.get("last")) if isinstance(st.get("last"), str) else None
+        if last and 0 <= (now_dt - last).total_seconds() < NOTIFY_EVERY:
+            st["unsent"] = unsent + 1
+            _private_write(st_path, json.dumps(st))
+            return
+        n = unsent + 1
+        _private_write(st_path, json.dumps({"last": now_dt.isoformat(timespec="seconds"), "unsent": 0}))
+    try:
+        subprocess.Popen(argv + ["{}: {} new".format(identity_name() or "core", n)], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass  # a missing doorbell never blocks a delivery
+
+
+def serve_bind_host() -> str:
+    """This Mac's Tailscale IPv4 address when Tailscale has one, else 127.0.0.1. Never a wildcard."""
+    import ipaddress
+    exe = shutil.which("tailscale")
+    if exe:
+        try:
+            r = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            r = None
+        if r is not None and r.returncode == 0:
+            for word in r.stdout.split():
+                try:
+                    ip = ipaddress.IPv4Address(word)
+                except ValueError:
+                    continue
+                if ip in ipaddress.IPv4Network(TAILNET_V4) and _address_is_local(str(ip)):
+                    return str(ip)
+    return "127.0.0.1"
+
+
+def _address_is_local(ip: str) -> bool:
+    """Tailscale can report its address while it is stopped; only an address this Mac holds right now counts."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((ip, 0))
+        return True
+    except OSError:
+        return False
+
+
+def serve_host_ok(host: str) -> bool:
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return str(ip) == "127.0.0.1" or (ip.version == 4 and ip in ipaddress.IPv4Network(TAILNET_V4))
+
+
+def serve_token() -> str:
+    """The secret path segment, kept in $CORE_HOME/serve.token (0600) so the phone's bookmark survives restarts.
+    Delete the file to rotate it."""
+    p = home_dir() / "serve.token"
+    try:
+        tok = p.read_text().strip()
+    except OSError:
+        tok = ""
+    if not SERVE_TOKEN_RE.match(tok):
+        import secrets
+        ensure_home()
+        tok = secrets.token_urlsafe(32)
+        _private_write(p, tok + "\n")
+    os.chmod(str(p), 0o600)
+    return tok
+
+
+def page_answerable(it) -> bool:
+    """Ordinary offers only, and only ones whose text the page can show. A grant (standing permission, overnight
+    job) needs the person's own words; a skill patch needs its diff read; a consolidation rewrites learned memory in
+    a session. Those stay on the Mac."""
+    tags = it.get("tags") or {}
+    return (it.get("kind") == "offer" and it.get("status") == "pending" and display_ok(it.get("text", ""))
+            and not any(tags.get(t) for t in ("grant", "grant_job", "patch", "granted"))
+            and tags.get("type") not in ("skill-patch", "consolidate") and it.get("source") not in ("skill", "permissions"))
+
+
+def _home_folder_name(home) -> str:
+    """How Claude Code names a project folder: the working directory with every non-alphanumeric as '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(home).rstrip("/"))
+
+
+def project_from_cwd(cwd, home) -> str:
+    """The folder a session ran in, by name; the home folder itself is 'general'."""
+    return "general" if str(cwd).rstrip("/") == str(home).rstrip("/") else Path(str(cwd)).name
+
+
+def project_from_folder(folder, home) -> str:
+    """The project from a transcript's folder name alone ('-Users-sam-code-myapp' -> 'myapp'). '-' is both the
+    separator and a legal name character, so the path is walked on disk where it can be: under an existing
+    ~/code, '-code-sample-site' is 'sample-site' (what's left past the deepest real folder is one name).
+    When nothing on disk matches, the last word."""
+    prefix = _home_folder_name(home)
+    if folder == prefix:
+        return "general"
+    if not folder.startswith(prefix + "-"):
+        return folder.rsplit("-", 1)[-1] or folder
+    words, cur, i = folder[len(prefix) + 1:].split("-"), Path(home), 0
+    while i < len(words):
+        step = next((j for j in range(len(words), i, -1) if (cur / "-".join(words[i:j])).is_dir()), None)
+        if step is None:
+            break
+        if step == len(words):
+            return "-".join(words[i:])
+        cur, i = cur / "-".join(words[i:step]), step
+    return "-".join(words[i:]) if i else words[-1]
+
+
+def find_transcript(stem8, cache) -> Path:
+    """The transcript whose name starts with this 8-character session prefix, or None. `cache` is one render's
+    {prefix: path} so a page with several offers globs once."""
+    if "_all" not in cache:
+        cache["_all"] = sweep_sources(headless=True)
+    if stem8 not in cache:
+        cache[stem8] = next((p for p in cache["_all"] if p.name.startswith(stem8)), None)
+    return cache[stem8]
+
+
+def transcript_record(path, line):
+    """The JSON record on one line of a transcript, or {}."""
+    try:
+        with open(str(path), errors="replace") as fh:
+            for n, raw in enumerate(fh, 1):
+                if n == line:
+                    d = json.loads(raw)
+                    return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def day_label(dt, now_dt) -> str:
+    """'Monday 7:42 AM' within the last week, 'Sep 21, 7:42 AM' before that; '' when there's no time."""
+    if not dt:
+        return ""
+    dt = dt.astimezone(now_dt.tzinfo)
+    if 0 <= (now_dt.date() - dt.date()).days < 7:
+        return "{} {}".format(dt.strftime("%A"), clock(dt))
+    return "{} {}, {}".format(dt.strftime("%b"), dt.day, clock(dt))
+
+
+def said_where(sess, line, at, now_dt, cache):
+    """(cite, source) for a quote: 'Monday 7:42 AM · myapp' from the transcript line itself (its time, its
+    working directory, else its project folder), and the exact file:line for the disclosure. Without the
+    transcript: the offer's own time and the session id."""
+    path = find_transcript(sess, cache) if len(sess) >= 8 else None
+    rec = transcript_record(path, int(line)) if path else {}
+    ts = rec.get("timestamp") if isinstance(rec.get("timestamp"), str) else None
+    when = day_label(parse_time(ts.replace("Z", "+00:00")) if ts else parse_time(at) if isinstance(at, str) else None,
+                     now_dt)
+    if not path:
+        return when, "session {}, line {}".format(sess, line)
+    home = str(Path.home())
+    cwd = rec.get("cwd") if isinstance(rec.get("cwd"), str) and rec.get("cwd") else None
+    project = project_from_cwd(cwd, home) if cwd else project_from_folder(path.parent.name, home)
+    return " · ".join(p for p in (when, project) if p), "{}:{}".format(display_path(path), line)
+
+
+def page_offer(it, now_dt, cache=None) -> dict:
+    """How one offer reads on the page: a type label, the plain statement, the person's words, where it came from.
+    Every string comes from display-filtered text or from core's own tags (internal items only)."""
+    tags, cache = it.get("tags") or {}, {} if cache is None else cache
+    internal = item_origin(it) == "internal"
+    text = display_text(it)
+    when = when_label(it.get("at"), now_dt)
+    o = {"id": it["id"], "short": short_id(it["id"]), "label": "", "statement": text, "quote": "", "cite": "", "source": "",
+         "evidence": "", "answerable": page_answerable(it), "mac": "", "mac_cmd": "", "kind": ""}
+    m = SWEEP_PAGE_RE.match(text) if it.get("source") == "sweep" and display_ok(it["text"]) else None
+    if internal and it.get("source") == "sweep" and tags.get("question") in KIND_ANSWER_LABELS and display_ok(it["text"]):
+        o["label"] = "Quick Question"
+        o["kind"] = tags["question"]
+        o["statement"] = re.sub(r"^Quick one:\s*", "", text)
+        o["statement"] = o["statement"][:1].upper() + o["statement"][1:]
+        o["cite"] = when
+    elif m:
+        o["label"] = TYPE_LABELS.get(m.group("type") or tags.get("type", ""), "Memory")
+        if m.group("file"):
+            o["label"] = "Update · " + TYPE_LABELS.get(tags.get("type", ""), "Memory")
+            o["evidence"] = "Replaces {} line {}: “{}”".format(m.group("file"), m.group("n"), m.group("was"))
+        o["statement"], o["quote"] = you_voice(m.group("stmt")), m.group("quote")
+        o["kind"] = "memory"
+        o["cite"], o["source"] = said_where(m.group("sess"), m.group("line"), it.get("at"), now_dt, cache)
+    elif tags.get("type") == "insight" and display_ok(it["text"]):
+        o["label"] = "Insight"
+        o["kind"] = "insight"
+        m = INSIGHT_PAGE_RE.match(text)
+        if m:
+            o["statement"], o["evidence"] = m.group("stmt"), "From your day: " + m.group("from")
+        o["cite"] = "Evening pass · " + when
+    elif internal and tags.get("grant"):
+        o["label"] = "Standing Permission"
+        job, scope = tags.get("grant_job", ""), tags.get("grant", "")
+        kind = scope.split(":", 1)[1] if scope.startswith("sweep:") else ""
+        if job and JOB_NAME_RE.match(job):
+            o["statement"] = "Let the overnight job {} run unattended every night?".format(job)
+        elif kind in SWEEP_TYPES:
+            o["statement"] = "Save new {} without asking you first?".format(
+                {"loop": "open loops", "fact": "facts"}.get(kind, kind + "s"))
+        o["mac"] = "It takes your own words, so it waits for the terminal."
+        o["mac_cmd"] = 'core offer yes {} --note "…"'.format(o["short"])
+        o["cite"] = when
+    elif internal and tags.get("type") == "consolidate" and display_ok(it["text"]):
+        o["label"] = "Tidy What I Learned"
+        o["statement"] = it["text"].split("): ", 1)[-1]
+        o["mac"] = "It rewrites what I learned, so it happens in a session with you."
+        o["mac_cmd"] = "core offer yes {}".format(o["short"])
+        o["cite"] = "Evening pass · " + when
+    elif internal and it.get("source") == "skill":
+        o["label"] = "Skill Patch"
+        m = SKILL_PAGE_RE.match(text) if display_ok(it["text"]) else None
+        name = tags.get("skill", "") if SKILL_NAME_RE.match(tags.get("skill", "") or "-") else ""
+        o["statement"] = "A change to the {} skill, from something you corrected.".format(name or "a")
+        if m:
+            o["statement"] = "Change the {} skill: {}.".format(m.group("name"), m.group("changes").rstrip("."))
+            o["quote"] = m.group("quote")
+            o["cite"], o["source"] = said_where(m.group("sess"), m.group("line"), it.get("at"), now_dt, cache)
+        o["mac"] = "Read the diff before it changes anything."
+        o["mac_cmd"] = "core skill list"
+    else:
+        o["label"] = "From " + display_source(it)
+        o["cite"] = when
+    if not o["answerable"] and not o["mac"]:
+        o["mac"] = "Open it in the terminal to read the whole thing."
+        o["mac_cmd"] = "core inbox"
+    return o
+
+
+def page_learned(e, now_dt, cache=None) -> dict:
+    """How one learned entry reads on the page: its type, the statement spoken to the person, their words, when and
+    where they said it, what it replaced or superseded. Text that fails the display filters becomes a pointer."""
+    cache = {} if cache is None else cache
+    ok = display_ok(e["stmt"]) and display_ok(e["quote"])
+    o = {"id": e["id"], "label": TYPE_LABELS.get(e["type"], "Memory"), "today": e["today"],
+         "statement": you_voice(e["stmt"]) if ok else "A note I saved. Read it on your Mac: core learned.",
+         "quote": e["quote"] if ok else "", "cite": "", "source": "", "evidence": ""}
+    m = re.match(r"^\S+ (?P<sess>[\w-]{8}):(?P<line>\d+)$", e["where"].strip())
+    if m:
+        o["cite"], o["source"] = said_where(m.group("sess"), m.group("line"), e["dt"].isoformat(), now_dt, cache)
+        project = e["where"].split(" ")[0]
+        if project and project not in o["cite"]:  # the transcript is gone: the project recorded at save time
+            o["cite"] = " · ".join(x for x in (o["cite"], project) if x)
+    else:
+        o["cite"] = day_label(e["dt"], now_dt)
+    rec = e.get("rec") or {}
+    if e.get("sup"):
+        was = rec.get("was", "")
+        name = Path(e["sup"].rsplit(":", 1)[0]).name
+        line = e["sup"].rsplit(":", 1)[-1]
+        o["label"] = "Update · " + o["label"]
+        o["evidence"] = ("Updates {} line {}{}. Your file is unchanged.".format(
+            name, line, ", which says “{}”".format(one_line(was, 90).rstrip(".")) if was and display_ok(was) else ""))
+    elif rec.get("replaced"):
+        old = LEARNED_LINE_RE.match(rec["replaced"])
+        if old and display_ok(old.group("stmt")):
+            o["label"] = "Update · " + o["label"]
+            o["evidence"] = "Replaces what I had: “{}”".format(one_line(you_voice(old.group("stmt")), 120))
+    return o
+
+
+def _esc(text) -> str:
+    import html
+    return html.escape(str(text), quote=True)
+
+
+NOWRAP_RE = re.compile(r"\S*\w[-/]\w\S*")
+
+
+def _esc_words(text) -> str:
+    """Escaped text where short hyphenated names (example-site, notes-app) never break at their hyphen."""
+    text, out, last = str(text), [], 0
+    for m in NOWRAP_RE.finditer(text):
+        if len(m.group()) > 24:
+            continue
+        out += [_esc(text[last:m.start()]), '<span class="nw">{}</span>'.format(_esc(m.group()))]
+        last = m.end()
+    return "".join(out + [_esc(text[last:])])
+
+
+PAGE_CSS = """
+:root{
+  color-scheme: light dark;
+  --paper: oklch(97.4% 0.006 80);
+  --dawn: oklch(93.5% 0.028 75);
+  --ink: oklch(25% 0.014 255);
+  --ink-soft: oklch(41% 0.014 255);
+  --ink-faint: oklch(51% 0.012 255);
+  --rule: oklch(88.5% 0.009 80);
+  --rule-strong: oklch(80% 0.01 80);
+  --press: oklch(92.5% 0.01 80);
+  --accent: oklch(45% 0.075 190);
+  --accent-press: oklch(39% 0.075 190);
+  --on-accent: oklch(98% 0.008 190);
+  --alarm: oklch(48% 0.13 40);
+  --alarm-wash: oklch(94.5% 0.025 50);
+  --toast: oklch(27% 0.014 255);
+  --on-toast: oklch(96% 0.006 80);
+  --space-3xs: 2px; --space-2xs: 4px; --space-xs: 8px; --space-sm: 12px; --space-md: 16px;
+  --space-lg: 24px; --space-xl: 32px; --space-2xl: 48px; --space-3xl: 64px; --space-4xl: 96px;
+  --serif: "Iowan Old Style", "Charter", "Palatino", "Book Antiqua", Georgia, serif;
+  --sans: "Avenir Next", "Avenir", "Seravek", "Gill Sans", "Trebuchet MS", sans-serif;
+  --mono: "Menlo", "Consolas", monospace;
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --paper: oklch(19% 0.012 255);
+    --dawn: oklch(25.5% 0.03 250);
+    --ink: oklch(93% 0.008 80);
+    --ink-soft: oklch(80% 0.01 80);
+    --ink-faint: oklch(67% 0.012 255);
+    --rule: oklch(29% 0.014 255);
+    --rule-strong: oklch(38% 0.014 255);
+    --press: oklch(24% 0.014 255);
+    --accent: oklch(77% 0.085 190);
+    --accent-press: oklch(70% 0.085 190);
+    --on-accent: oklch(20% 0.02 200);
+    --alarm: oklch(76% 0.11 50);
+    --alarm-wash: oklch(25% 0.035 45);
+    --toast: oklch(90% 0.01 80);
+    --on-toast: oklch(20% 0.012 255);
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{
+  margin:0;min-height:100vh;color:var(--ink);font-family:var(--sans);font-size:17px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  /* The masthead sits in early light: the one place the page looks ahead. Everything below is plain paper. */
+  background:var(--paper) radial-gradient(120% 340px at 50% -60px, var(--dawn), transparent 75%) no-repeat;
+}
+main{
+  max-width:36rem;margin:0 auto;
+  padding:calc(env(safe-area-inset-top) + var(--space-xl)) max(var(--space-md), env(safe-area-inset-right))
+          calc(env(safe-area-inset-bottom) + var(--space-4xl)) max(var(--space-md), env(safe-area-inset-left));
+  display:flex;flex-direction:column;gap:var(--space-2xl);
+}
+header{display:flex;flex-direction:column;gap:var(--space-xs)}
+.lede{margin:var(--space-xs) 0 0;max-width:34ch;font-size:17px;line-height:1.45;color:var(--ink-soft)}
+.who{margin:0;font-weight:600;font-size:15px;letter-spacing:0.01em;color:var(--ink-soft);display:flex;
+  justify-content:space-between;gap:var(--space-sm);flex-wrap:wrap}
+.who time{font-weight:500;color:var(--ink-faint);font-variant-numeric:tabular-nums}
+h1{margin:0;font-family:var(--serif);font-weight:400;font-size:34px;line-height:1.12;letter-spacing:-0.01em;
+  text-wrap:balance;max-width:20ch}
+.alarms{display:flex;flex-direction:column;gap:var(--space-xs);margin:0;padding:var(--space-sm) var(--space-md);
+  background:var(--alarm-wash);border-radius:var(--radius);color:var(--ink)}
+.alarms p{margin:0;display:flex;gap:var(--space-xs)}
+.alarms b{color:var(--alarm);font-weight:700}
+section{display:flex;flex-direction:column;gap:var(--space-md)}
+h2{margin:0;font-size:15px;font-weight:600;letter-spacing:0.01em;color:var(--ink-soft);display:flex;
+  align-items:baseline;gap:var(--space-xs);padding-bottom:var(--space-xs);border-bottom:1px solid var(--rule)}
+ol,ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
+.offers{gap:0}
+.offer{display:flex;flex-direction:column;gap:var(--space-sm);padding:var(--space-lg) 0;
+  border-bottom:1px solid var(--rule)}
+.offer:first-child{padding-top:var(--space-xs)}
+.kind{margin:0;font-size:14px;font-weight:600;color:var(--accent);letter-spacing:0.01em}
+.statement{margin:0;font-family:var(--serif);font-size:22px;line-height:1.36;max-width:34ch;overflow-wrap:break-word}
+.said{margin:0;display:flex;flex-direction:column;gap:var(--space-2xs)}
+.said blockquote{margin:0;font-family:var(--serif);font-style:italic;font-size:17px;line-height:1.45;
+  color:var(--ink-soft);max-width:60ch;overflow-wrap:break-word}
+.cite,.evidence,.meta{margin:0;font-size:13px;line-height:1.45;color:var(--ink-faint);max-width:60ch;
+  overflow-wrap:break-word;font-variant-numeric:tabular-nums}
+.evidence{font-size:14px;color:var(--ink-soft)}
+.said .cite{display:flex;flex-wrap:wrap;align-items:center;column-gap:var(--space-xs)}
+.source summary{display:inline-flex;align-items:center;min-height:44px;padding:0 var(--space-xs);
+  margin:-12px calc(-1 * var(--space-xs));color:var(--ink-faint);text-decoration:underline;
+  text-decoration-color:var(--rule-strong);text-underline-offset:3px;cursor:pointer;list-style:none;
+  -webkit-tap-highlight-color:transparent}
+.source summary::-webkit-details-marker{display:none}
+.source summary:focus-visible{outline:2px solid var(--accent);outline-offset:-6px;border-radius:6px}
+.source[open]{flex-basis:100%}
+.source code{display:block;font-family:var(--mono);font-size:12px;color:var(--ink-soft);overflow-wrap:anywhere;
+  font-variant-ligatures:none;padding-top:var(--space-2xs)}
+.answers{display:grid;grid-template-columns:1.35fr 1fr 1fr;gap:var(--space-xs);margin:var(--space-xs) 0 0}
+.answers button{
+  font:inherit;font-size:16px;font-weight:600;min-height:48px;padding:0 var(--space-xs);border-radius:var(--radius);
+  border:1px solid var(--rule-strong);background:transparent;color:var(--ink);cursor:pointer;
+  -webkit-tap-highlight-color:transparent;touch-action:manipulation;
+  transition:background-color 160ms var(--ease-out-quart), transform 160ms var(--ease-out-quart);
+}
+.answers button:active{background:var(--press);transform:scale(0.97)}
+.answers button.yes{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.answers button.yes:active{background:var(--accent-press)}
+/* Never is permanent: the quietest choice, last, and it says what it does. */
+.answers button.never{grid-column:1 / -1;justify-self:end;min-height:44px;margin:var(--space-2xs) calc(-1 * var(--space-xs)) 0;
+  padding:0 var(--space-xs);border:0;background:transparent;color:var(--ink-faint);font-size:15px;font-weight:500;
+  text-decoration:underline;text-decoration-color:var(--rule-strong);text-underline-offset:3px}
+.answers button.never:active{background:var(--press);transform:none}
+.answers button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.answers[aria-busy="true"] button{opacity:0.55}
+.on-mac{margin:var(--space-xs) 0 0;display:flex;flex-direction:column;gap:var(--space-2xs);padding:var(--space-sm) var(--space-md);
+  border:1px dashed var(--rule-strong);border-radius:var(--radius)}
+.on-mac strong{font-size:15px;font-weight:600}
+.on-mac span{font-size:14px;color:var(--ink-soft)}
+.on-mac code{font-family:var(--mono);font-size:13px;color:var(--ink-soft);overflow-wrap:anywhere;font-variant-ligatures:none}
+.held{margin:0;font-size:14px;color:var(--ink-faint)}
+h3{margin:0;font-size:13px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:var(--ink-faint)}
+.day{display:flex;flex-direction:column;gap:var(--space-2xs)}
+.lessons{gap:0}
+.lesson{display:flex;flex-direction:column;gap:var(--space-xs);padding:var(--space-md) 0;border-bottom:1px solid var(--rule)}
+.lesson:last-child{border-bottom:0}
+.lesson .statement{font-size:19px;line-height:1.4;text-wrap:pretty}
+.lesson .said blockquote{font-size:16px}
+.undo{margin:0;display:flex}
+.undo button{font:inherit;font-size:15px;font-weight:600;min-height:44px;min-width:88px;padding:0 var(--space-md);
+  border-radius:var(--radius);border:1px solid var(--rule-strong);background:transparent;color:var(--ink);cursor:pointer;
+  -webkit-tap-highlight-color:transparent;touch-action:manipulation;
+  transition:background-color 160ms var(--ease-out-quart), transform 160ms var(--ease-out-quart)}
+.undo button:active{background:var(--press);transform:scale(0.97)}
+.undo button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.undo[aria-busy="true"] button{opacity:0.55}
+.quiet{margin:0;font-family:var(--serif);font-size:20px;color:var(--ink-soft)}
+.notes{gap:var(--space-md)}
+.notes li{display:flex;flex-direction:column;gap:var(--space-2xs);max-width:65ch}
+.notes p{margin:0;overflow-wrap:break-word}
+footer{display:flex;align-items:baseline;gap:var(--space-xs);font-size:13px;color:var(--ink-faint);
+  border-top:1px solid var(--rule);padding-top:var(--space-sm);font-variant-numeric:tabular-nums}
+footer .ok{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none;transform:translateY(-1px)}
+footer p{margin:0}
+.toast{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + var(--space-lg));z-index:2;margin:0;
+  max-width:calc(100vw - 2 * var(--space-md));width:max-content;padding:var(--space-sm) var(--space-md);
+  border-radius:999px;background:var(--toast);color:var(--on-toast);font-size:15px;font-weight:500;
+  transform:translate(-50%, 0);opacity:1;
+  transition:opacity 260ms var(--ease-out-quart), transform 260ms var(--ease-out-quart)}
+.toast[hidden]{display:block;visibility:hidden;opacity:0;transform:translate(-50%, 12px)}
+/* The one motion on the page: an answered offer leaves, and the ones below close the gap (transform only). */
+.offer.leaving,.lesson.leaving{opacity:0;transform:translateX(24px);
+  transition:opacity 240ms var(--ease-out-quart), transform 320ms var(--ease-out-quart)}
+.offer.settling,.lesson.settling{transition:transform 420ms var(--ease-out-expo)}
+.nw{white-space:nowrap}
+.flash{margin:calc(-1 * var(--space-lg)) 0 0;font-size:15px;font-weight:500;color:var(--accent)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+@media (min-width: 720px){
+  main{padding-top:var(--space-4xl);gap:var(--space-3xl)}
+  h1{font-size:42px}
+  .statement{font-size:24px}
+}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{transition:none !important;animation:none !important}
+}
+"""
+
+PAGE_JS = """
+(function(){
+  var toast = document.getElementById('toast'), timer;
+  function say(msg){
+    toast.textContent = msg; toast.hidden = false;
+    clearTimeout(timer); timer = setTimeout(function(){ toast.hidden = true; }, 2800);
+  }
+  if (document.getElementById('flash') && history.replaceState) history.replaceState(null, '', location.pathname);
+  var still = !window.matchMedia || matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function leave(li, done){
+    if (still) { li.remove(); return done(); }
+    var after = [], n = li.nextElementSibling;
+    for (; n; n = n.nextElementSibling) after.push([n, n.getBoundingClientRect().top]);
+    li.classList.add('leaving');
+    setTimeout(function(){
+      li.remove();
+      after.forEach(function(p){
+        var dy = p[1] - p[0].getBoundingClientRect().top;
+        p[0].style.transform = 'translateY(' + dy + 'px)';
+      });
+      requestAnimationFrame(function(){ requestAnimationFrame(function(){
+        after.forEach(function(p){ p[0].classList.add('settling'); p[0].style.transform = ''; });
+        setTimeout(function(){ after.forEach(function(p){ p[0].classList.remove('settling'); }); }, 460);
+      }); });
+      done();
+    }, 260);
+  }
+  var words = ['', 'One thing needs', 'Two things need', 'Three things need', 'Four things need', 'Five things need'];
+  function post(f, b, then){
+    var body = new URLSearchParams();
+    body.append('nonce', f.elements.nonce.value); body.append('answer', b.value);
+    return fetch(f.action, {method: 'POST', body: body, credentials: 'same-origin',
+                            headers: {'Accept': 'application/json'}})
+      .then(function(r){ return r.json(); })
+      .then(then)
+      .catch(function(){ f.removeAttribute('aria-busy'); say('Not recorded: the Mac didn\u2019t answer. Try again.'); });
+  }
+  document.addEventListener('submit', function(e){
+    var f = e.target, b = e.submitter;
+    if (!f.classList.contains('undo') || !b || !window.fetch) return;
+    e.preventDefault();
+    if (f.getAttribute('aria-busy') === 'true') return;
+    f.setAttribute('aria-busy', 'true');
+    post(f, b, function(j){
+      if (!j.ok && j.stale) { say(j.message); setTimeout(function(){ location.reload(); }, 1600); return; }
+      say(j.message);
+      if (!j.ok && !j.gone) { f.removeAttribute('aria-busy'); return; }
+      var li = f.closest('.lesson'), today = li.hasAttribute('data-today');
+      leave(li, function(){
+        var hl = document.getElementById('hl-learned');
+        if (today && hl) {
+          var n = document.querySelectorAll('.lesson[data-today]').length;
+          hl.textContent = n ? 'Learned ' + n + (n === 1 ? ' thing' : ' things') + ' today.' : '';
+          if (!n && hl.nextSibling && hl.nextSibling.nodeType === 3) hl.nextSibling.remove();
+        }
+        document.querySelectorAll('.day').forEach(function(d){ if (!d.querySelector('.lesson')) d.remove(); });
+      });
+    });
+  });
+  document.addEventListener('submit', function(e){
+    var f = e.target, b = e.submitter;
+    if (!f.classList.contains('answers') || !b || !window.fetch) return;
+    e.preventDefault();
+    if (f.getAttribute('aria-busy') === 'true') return;
+    f.setAttribute('aria-busy', 'true');
+    var body = new URLSearchParams();
+    body.append('nonce', f.elements.nonce.value); body.append('answer', b.value);
+    fetch(f.action, {method: 'POST', body: body, credentials: 'same-origin',
+                     headers: {'Accept': 'application/json'}})
+      .then(function(r){ return r.json().then(function(j){ return [r, j]; }); })
+      .then(function(rj){
+        var j = rj[1];
+        if (!j.ok && j.stale) { say(j.message); setTimeout(function(){ location.reload(); }, 1600); return; }
+        var li = f.closest('.offer');
+        say(j.message);
+        if (!j.ok && !j.gone) { f.removeAttribute('aria-busy'); return; }
+        leave(li, function(){
+          var list = document.getElementById('offers');
+          var left = list.querySelectorAll('.offer').length;
+          document.getElementById('hl-needs').textContent =
+            left ? (words[left] || left + ' things need') + ' you.' : 'Nothing else needs you.';
+          if (!left) { var p = document.createElement('p'); p.className = 'quiet';
+            p.textContent = 'Nothing else needs you.'; list.replaceWith(p); }
+        });
+      })
+      .catch(function(){ f.removeAttribute('aria-busy'); say('Not recorded: the Mac didn\\u2019t answer. Try again.'); });
+  });
+})();
+"""
+
+
+def _headline(n_offers, n_noticed, alarms) -> str:
+    """What needs the person, in one sentence. Only real asks count: what was learned without asking never does."""
+    words = {1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five"}
+    if n_offers:
+        return "{} {} you.".format(words.get(n_offers, str(n_offers)), "thing needs" if n_offers == 1 else "things need")
+    if alarms:
+        return "Something stopped running."
+    if n_noticed:
+        return "Nothing needs an answer."
+    return "Nothing needs you."
+
+
+def _learned_headline(n_today) -> str:
+    return "Learned {} thing{} today.".format(n_today, "" if n_today == 1 else "s") if n_today else ""
+
+
+def home_page(now_dt, nonce: str, script_nonce: str, base: str, flash: str = "") -> str:
+    """The home screen as one self-contained page (inline CSS and JS, no outside requests). `base` is the
+    token path ('/<token>/'); `flash` is the confirmation shown after a plain (no-JS) form post."""
+    d = home_data(now_dt)
+    cache = {}
+    offers = [page_offer(it, now_dt, cache) for it in d["offers"]]
+    out = []
+    w = out.append
+    title = d["title"] if d["title"] != "Home" else "Home"
+    w('<!doctype html><html lang="en"><head><meta charset="utf-8">')
+    w('<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">')
+    w('<meta name="referrer" content="no-referrer"><meta name="robots" content="noindex, nofollow">')
+    w('<meta name="theme-color" content="#f6f4ef" media="(prefers-color-scheme: light)">')
+    w('<meta name="theme-color" content="#1a1d22" media="(prefers-color-scheme: dark)">')
+    w('<meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="{}">'
+      .format(_esc(title)))
+    w('<title>{}</title><style nonce="{}">{}</style></head><body><main>'.format(_esc(title), script_nonce, PAGE_CSS))
+    w('<header><p class="who"><span>{}</span><time datetime="{}">{} {} · {}</time></p>'.format(
+        _esc(title), now_dt.isoformat(timespec="minutes"), now_dt.strftime("%a %b"), now_dt.day, clock(now_dt)))
+    lh = _learned_headline(d["learned_today"])
+    w('<h1 id="headline"><span id="hl-learned">{}</span>{}<span id="hl-needs">{}</span></h1>'.format(
+        _esc(lh), " " if lh else "", _esc(_headline(len(offers), len(d["noticed"]), d["alarms"]))))
+    if any(o.get("kind") == "memory" for o in offers) and learn_mode() != "auto":
+        w('<p class="lede">I noticed these in our conversations. Should I remember them for next time? '
+          'Most one-off fixes are fine to forget.</p>')
+    w('</header>')
+    if flash:  # after a plain form post: in the flow, so it never covers anything
+        w('<p class="flash" id="flash" role="status">{}</p>'.format(_esc(flash)))
+    if d["alarms"]:
+        w('<div class="alarms" role="alert">')
+        for a in d["alarms"]:
+            shown = a if display_ok(a) else a.split(":", 1)[0] + " (details: core heartbeat)"
+            w('<p><b aria-hidden="true">!</b><span>{}</span></p>'.format(_esc(shown)))
+        w('</div>')
+    learned_shown = bool(d["learned"] or d["strict_notes"])
+    if learned_shown:
+        w('<section aria-labelledby="learned" id="learned-section"><h2 id="learned">What I Learned</h2>')
+        if d["learned"]:
+            w('<p class="lede">I saved these from our conversations, in your own words. Undo anything that’s '
+              'wrong and I won’t save it again.</p>')
+        for heading, group in (("Today", [e for e in d["learned"] if e["today"]]),
+                               ("Earlier This Week", [e for e in d["learned"] if not e["today"]])):
+            if not group:
+                continue
+            w('<div class="day"><h3>{}</h3><ol class="lessons">'.format(heading))
+            for e in group:
+                o = page_learned(e, now_dt, cache)
+                w('<li class="lesson" id="l-{}"{}><p class="kind">{}</p><p class="statement">{}</p>'.format(
+                    _esc(o["id"]), ' data-today="1"' if o["today"] else "", _esc(o["label"]),
+                    _esc_words(o["statement"])))
+                if o["quote"]:
+                    w('<figure class="said"><blockquote>“{}”</blockquote>'.format(_esc_words(o["quote"])))
+                    w('<figcaption class="cite"><span>{}</span>'.format(_esc(o["cite"])))
+                    if o["source"]:
+                        w('<details class="source"><summary>Source</summary><code>{}</code></details>'
+                          .format(_esc(o["source"])))
+                    w('</figcaption></figure>')
+                elif o["cite"]:
+                    w('<p class="cite">{}</p>'.format(_esc(o["cite"])))
+                if o["evidence"]:
+                    w('<p class="evidence">{}</p>'.format(_esc_words(o["evidence"])))
+                w('<form class="undo" method="post" action="{}learned/{}"><input type="hidden" name="nonce" value="{}">'
+                  '<button type="submit" name="answer" value="undo">Undo</button></form></li>'.format(
+                      _esc(base), _esc(o["id"]), _esc(nonce)))
+            w('</ol></div>')
+        for note in d["strict_notes"]:
+            w('<p class="held">{}</p>'.format(_esc(note)))
+        w('</section>')
+    if offers or d["held"]:
+        if offers and not learned_shown:  # the headline already says it: no sub-header repeating it
+            w('<section aria-labelledby="hl-needs">')
+        else:  # under What I Learned, the asks need their own heading
+            w('<section aria-labelledby="needs"><h2 id="needs">Needs You</h2>')
+        if offers:
+            w('<ol class="offers" id="offers">')
+            for o in offers:
+                w('<li class="offer" id="o-{}"><p class="kind">{}</p><p class="statement">{}</p>'.format(
+                    _esc(o["short"]), _esc(o["label"]), _esc_words(o["statement"])))
+                if o["quote"]:
+                    w('<figure class="said"><blockquote>“{}”</blockquote>'.format(_esc_words(o["quote"])))
+                    if o["cite"] or o["source"]:
+                        w('<figcaption class="cite"><span>{}</span>'.format(_esc(o["cite"])))
+                        if o["source"]:
+                            w('<details class="source"><summary>Source</summary><code>{}</code></details>'
+                              .format(_esc(o["source"])))
+                        w('</figcaption>')
+                    w('</figure>')
+                elif o["cite"]:
+                    w('<p class="cite">{}</p>'.format(_esc(o["cite"])))
+                if o["evidence"]:
+                    w('<p class="evidence">{}</p>'.format(_esc_words(o["evidence"])))
+                if o["answerable"]:
+                    w('<form class="answers" method="post" action="{}offer/{}"><input type="hidden" name="nonce" '
+                      'value="{}">'.format(_esc(base), _esc(o["id"]), _esc(nonce)))
+                    for a in ("yes", "later", "no", "never"):
+                        labels = KIND_ANSWER_LABELS.get(o.get("kind"), ANSWER_LABELS)
+                        w('<button type="submit" name="answer" value="{a}"{c}>{l}</button>'.format(
+                            a=a, l=labels[a], c=' class="{}"'.format(a) if a in ("yes", "never") else ""))
+                    w('</form>')
+                else:
+                    w('<div class="on-mac"><strong>Answer On Your Mac</strong><span>{}</span><code>{}</code></div>'
+                      .format(_esc(o["mac"]), _esc(o["mac_cmd"])))
+                w('</li>')
+            w('</ol>')
+        if d["held"]:
+            w('<p class="held">{}</p>'.format(_esc(d["held_note"])))
+        w('</section>')
+    if d["noticed"]:
+        w('<section aria-labelledby="noticed"><h2 id="noticed">Noticed</h2><ul class="notes">')
+        for it in d["noticed"][:HOME_NOTICED]:
+            meta = " · ".join(m for m in (display_source(it), when_label(it["at"], now_dt)) if m)
+            w('<li><p>{}</p><p class="meta">{}</p></li>'.format(_esc_words(display_text(it)), _esc(meta)))
+        if len(d["noticed"]) > HOME_NOTICED:
+            w('<li><p class="meta">{} more on your Mac: core inbox</p></li>'.format(len(d["noticed"]) - HOME_NOTICED))
+        w('</ul></section>')
+    if d["done"]:
+        w('<section aria-labelledby="done"><h2 id="done">Done Today</h2><ul class="notes">')
+        for text, _ in d["done"]:
+            w('<li><p>{}</p></li>'.format(_esc_words(text)))
+        w('</ul></section>')
+    if d["footer"]:
+        w('<footer><span class="ok" aria-hidden="true"></span><p>{}</p></footer>'.format(" · ".join(
+            '<span class="nw">{}</span>'.format(_esc(part)) for part in d["footer"].split(" · "))
+          .replace("</span> · ", " ·</span> ")))
+    w('<p class="toast" id="toast" role="status" aria-live="polite" hidden></p>')
+    w('</main><script nonce="{}">{}</script></body></html>'.format(script_nonce, PAGE_JS))
+    return "".join(out)
+
+
+def page_answer(oid: str, answer: str):
+    """Record an answer exactly as `core offer <answer> <oid>` does (it IS cmd_offer, same lock and log).
+    Returns (http status, message, gone)."""
+    import io
+    cur = read_item(inbox_dir() / (oid + ".json")) if ITEM_ID_RE.match(oid) else None
+    if not cur or cur.get("kind") != "offer":
+        return 409, "That one is gone: answered or retired elsewhere.", True
+    if cur.get("status") == "pending" and not page_answerable(cur):
+        return 403, "Answer this one on your Mac.", False
+    if cur.get("status") != "pending":
+        return 409, "That one was already answered ({}).".format(cur.get("status")), True
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cmd_offer(argparse.Namespace(answer=answer, item_id=oid, note=None))
+    if rc == 0:
+        return 200, ANSWER_RECORDED[answer], False
+    msg = one_line(err.getvalue().replace("core offer: ", ""), 200) or "core offer refused it"
+    return 409, "Not recorded: " + msg, "already answered" in msg
+
+
+UNDO_RECORDED = "Undone. I won\u2019t save that again."
+
+
+def page_undo(eid: str):
+    """Undo one learned entry exactly as `core learned undo <id>` does. Returns (http status, message, gone)."""
+    if not re.match(r"^[0-9a-f]{12}$", eid or ""):
+        return 409, "That one is already gone.", True
+    ok, msg = learn_undo(eid)
+    if ok:
+        return 200, UNDO_RECORDED + (" The earlier note is back." if "earlier note" in msg else ""), False
+    return 409, "That one is already gone.", True
+
+
+def _serve_handler(token: str):
+    import hmac
+    import http.server
+    import secrets
+    import threading
+    import urllib.parse
+
+    nonces = {}  # nonce -> expiry (monotonic); per process, so a restart retires every open page
+    nonces_lock = threading.Lock()  # requests run on their own threads
+
+    def new_nonce():
+        with nonces_lock:
+            t = time.monotonic()
+            for k in [k for k, exp in nonces.items() if exp < t]:
+                del nonces[k]
+            while len(nonces) >= SERVE_NONCES_MAX:
+                del nonces[min(nonces, key=nonces.get)]
+            n = secrets.token_urlsafe(18)
+            nonces[n] = t + SERVE_NONCE_TTL
+            return n
+
+    def nonce_ok(n):
+        with nonces_lock:
+            exp = nonces.get(n) if isinstance(n, str) and n else None
+            return bool(exp and exp >= time.monotonic())
+
+    def is_token(seg):
+        return hmac.compare_digest(seg.encode("utf-8", "replace"), token.encode())
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "core"
+        sys_version = ""
+        timeout = SERVE_CONN_TIMEOUT  # an idle or slow-body connection is dropped, and only ever holds its own thread
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, fmt, *args):  # request lines carry the token: never logged
+            pass
+
+        def send_error(self, code, message=None, explain=None):
+            self.send_response(404 if code in (404, 405, 501) else code)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+        def _send(self, status, body=b"", ctype="text/html; charset=utf-8", extra=None):
+            self.send_response(status)
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            if body:
+                self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.end_headers()
+            if body and self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _segments(self):
+            return urllib.parse.urlsplit(self.path).path.split("/")
+
+        def _origins(self):
+            """The host:port names this server answers to: its bound address, and localhost when bound locally."""
+            host, port = self.server.server_address[:2]
+            names = ["{}:{}".format(host, port)]
+            if host == "127.0.0.1":
+                names.append("localhost:{}".format(port))
+            return names
+
+        def _foreign(self, post=False):
+            """True for a request not meant for this page: another Host (DNS rebinding), or a POST another site
+            made (Sec-Fetch-Site: cross-site, or an Origin that isn't this page's own)."""
+            if (self.headers.get("Host") or "").strip().lower() not in self._origins():
+                return True
+            if post:
+                if (self.headers.get("Sec-Fetch-Site") or "").strip().lower() == "cross-site":
+                    return True
+                origin = self.headers.get("Origin")
+                if origin is not None and origin.strip().lower() not in ["http://" + n for n in self._origins()]:
+                    return True
+            return False
+
+        def do_GET(self):
+            if self._foreign():
+                return self.send_error(403)
+            seg = self._segments()
+            if not (len(seg) in (2, 3) and seg[0] == "" and is_token(seg[1]) and (len(seg) == 2 or seg[2] == "")):
+                return self.send_error(404)
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            r = (q.get("r") or [""])[0]
+            flash = (ANSWER_RECORDED.get(r) or (UNDO_RECORDED if r == "undo" else "") or
+                     ("That page was out of date, so nothing was recorded. Answer again below." if q.get("stale") else
+                      "That one is already gone." if q.get("gone") == ["learned"] else
+                      "That one was already answered elsewhere." if q.get("gone") else ""))
+            sn = secrets.token_urlsafe(18)
+            body = home_page(now(), new_nonce(), sn, "/{}/".format(token), flash).encode()
+            csp = ("default-src 'none'; style-src 'nonce-{0}'; script-src 'nonce-{0}'; connect-src 'self'; "
+                   "form-action 'self'; base-uri 'none'; frame-ancestors 'none'; img-src data:").format(sn)
+            self._send(200, body, extra={"Content-Security-Policy": csp})
+
+        def do_POST(self):
+            if self._foreign(post=True):
+                return self.send_error(403)
+            seg = self._segments()
+            if not (len(seg) == 4 and seg[0] == "" and is_token(seg[1]) and (
+                    (seg[2] == "offer" and ITEM_ID_RE.match(seg[3]))
+                    or (seg[2] == "learned" and re.match(r"^[0-9a-f]{12}$", seg[3])))):
+                return self.send_error(404)
+            oid = seg[3]
+            wants_json = "application/json" in (self.headers.get("Accept") or "")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0 or n > SERVE_BODY_MAX:
+                return self.send_error(400)
+            form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
+            answer, nonce = (form.get("answer") or [""])[0], (form.get("nonce") or [""])[0]
+            base = "/{}/".format(token)
+
+            def reply(status, message, flag="", ok=False, gone=False):
+                if wants_json:
+                    body = json.dumps({"ok": ok, "answer": answer if ok else "", "message": message,
+                                       "stale": flag == "stale", "gone": gone}).encode()
+                    return self._send(status, body, "application/json")
+                if status in (400, 403):
+                    body = ('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+                            '<title>Not Recorded</title><p>{}</p><p><a href="{}">Back</a></p>').format(
+                        _esc(message), base).encode()
+                    return self._send(status, body)
+                return self._send(303, extra={"Location": base + ("?" + flag if flag else "")})
+
+            if not nonce_ok(nonce):
+                return reply(409 if wants_json else 303, "This page was out of date, so nothing was recorded. "
+                             "Reloading.", "stale=1")
+            if seg[2] == "learned":
+                if answer != "undo":
+                    return reply(400, "Not recorded: the only answer here is Undo.")
+                status, message, gone = page_undo(oid)
+                if status == 200:
+                    return reply(200, message, "r=undo", ok=True)
+                return reply(status, message, "gone=learned", gone=gone)
+            if answer not in ANSWERS:
+                return reply(400, "Not recorded: the answers are Yes, Later, No and Never.")
+            status, message, gone = page_answer(oid, answer)
+            if status == 200:
+                return reply(200, message, "r=" + answer, ok=True)
+            return reply(status, message, "gone=1" if gone else "", gone=gone)
+
+    return Handler
+
+
+def make_server(host: str, port: int):
+    """An HTTP server on host:port, refusing anything but loopback or a tailnet address. Each connection gets its
+    own (daemon) thread with a short timeout, so one stalled phone can't lock the page; answers still go through
+    the inbox lock, and the nonces through their own."""
+    if not serve_host_ok(host):
+        raise ValueError("core serve listens only on 127.0.0.1 or a Tailscale address, not {!r}".format(host))
+    import http.server
+    httpd = http.server.ThreadingHTTPServer((host, port), _serve_handler(serve_token()))
+    httpd.daemon_threads = True
+    return httpd
+
+
+def cmd_serve(args) -> int:
+    host = "127.0.0.1" if args.local else serve_bind_host()
+    token = serve_token()
+    if args.url:
+        print("http://{}:{}/{}/".format(host, args.port, token))
+        return 0
+    try:
+        httpd = make_server(host, args.port)
+    except OSError as e:
+        print("core serve: can't listen on {}:{}: {} (another `core serve`? check `lsof -i :{}`)".format(
+            host, args.port, e.strerror or e, args.port), file=sys.stderr)
+        return 1
+    port = httpd.server_address[1]
+    print("core serve: open http://{}:{}/{}/".format(host, port, token), flush=True)
+    if host == "127.0.0.1" and not args.local:
+        print("core serve: Tailscale has no address right now, so only this Mac can open the page. "
+              "It moves to the tailnet when Tailscale is up (under launchd, by restarting).", file=sys.stderr, flush=True)
+    httpd.timeout = 5
+    check_at = time.monotonic() + SERVE_REBIND_CHECK
+    try:
+        while True:
+            httpd.handle_request()
+            if not args.local and time.monotonic() >= check_at:
+                check_at = time.monotonic() + SERVE_REBIND_CHECK
+                now_host = serve_bind_host()
+                if now_host != host:
+                    print("core serve: address changed ({} → {}); exiting so launchd restarts it there".format(
+                        host, now_host), file=sys.stderr, flush=True)
+                    return 75
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        httpd.server_close()
 
 
 # ---- overnight work: pre-approved jobs only, in checked legs, one morning report ----
@@ -4761,6 +6456,12 @@ def main(argv=None) -> int:
     p_home = sub.add_parser("home", help="the first screen: waiting on you, noticed, done today, job health")
     p_home.set_defaults(func=cmd_home)
 
+    p_serve = sub.add_parser("serve", help="the home screen as a private phone page (tailnet or this Mac only)")
+    p_serve.add_argument("--port", type=int, default=SERVE_PORT)
+    p_serve.add_argument("--local", action="store_true", help="listen on 127.0.0.1 even when Tailscale is up")
+    p_serve.add_argument("--url", action="store_true", help="print the page's URL and exit")
+    p_serve.set_defaults(func=cmd_serve)
+
     p_evening = sub.add_parser("evening", help="nightly wrap for tomorrow + at most one grounded insight offer")
     p_evening.set_defaults(func=cmd_evening)
 
@@ -4809,6 +6510,12 @@ def main(argv=None) -> int:
     p_skill.add_argument("skill_cmd", nargs="?", choices=["list", "undo"], default="list")
     p_skill.add_argument("patch_id", nargs="?")
     p_skill.set_defaults(func=cmd_skill)
+
+    p_learned = sub.add_parser("learned", help="what was learned without asking (learn_mode auto): list / undo <id>")
+    p_learned.add_argument("learned_cmd", nargs="?", choices=["list", "undo"], default="list")
+    p_learned.add_argument("learned_id", nargs="?")
+    p_learned.add_argument("--since", help="YYYY-MM-DD: only what was learned on or after this day")
+    p_learned.set_defaults(func=cmd_learned)
 
     p_grant = sub.add_parser("grant", help="standing permissions: list / revoke <scope>")
     p_grant.add_argument("grant_cmd", nargs="?", choices=["list", "revoke"], default="list")

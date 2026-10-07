@@ -84,9 +84,11 @@ it with `core loop add "<promise>"`.
 | `core offer yes\|no\|later\|never <id> [--note why]` / `core offer stats` | record the person's answer to an offer (later = back in 3 days; never = never re-asked; an offer left unanswered for a week *after it was first shown* expires as "unanswered" — no answer, not a no — and a late answer to it is still recorded, marked late). `--note` keeps their words; it is required to accept a standing-permission proposal |
 | `core skill` / `core skill undo <patch-id>` | list skill patches offered from your corrections (offered / applied / undone, and how the next use went) / put a patched SKILL.md back exactly as it was, if it hasn't changed since (see skill-patch offers below) |
 | `core grant` / `core grant revoke <scope>` | list standing permissions (scope, date, the person's own words) / revoke one; anything already queued under it goes back to being an offer |
-| `core sweep` | offer what's worth remembering from quiet conversations (see below) |
+| `core sweep` | offer what's worth remembering from quiet conversations — or, with `learn_mode auto`, learn it without asking (see below) |
+| `core learned [--since YYYY-MM-DD]` / `core learned undo <id>` | what was learned without asking, newest first, each with your words, when and where / take one back (a unique part of the id is enough); see [Learning without asking](#learning-without-asking) |
 | `core evening` | nightly wrap for tomorrow + at most one insight offer that cites its evidence (see below; sends data to the sweep model) |
-| `core home` | the first screen, from files only (no model, works offline): what's waiting on you (numbered offers, "N waiting", and asks held for tomorrow), what was noticed (unacknowledged results), what got done today (finished jobs, overnight's morning report, your answers), and job health — a broken job moves to the top. A view: it marks nothing as shown |
+| `core home` | the first screen, from files only (no model, works offline): what was learned this week (with each undo command), what's waiting on you (numbered offers, "N waiting", and asks held for tomorrow), what was noticed (unacknowledged results), what got done today (finished jobs, overnight's morning report, your answers), and job health — a broken job moves to the top. A view: it marks nothing as shown |
+| `core serve` | the home screen as a private phone page: Tailscale address (else 127.0.0.1) only, a secret token in the path, Yes · Later · No · Never on ordinary offers (recorded exactly like `core offer`); grants and skill patches are answered on the Mac. See [The phone page](#the-phone-page) |
 | `core heartbeat` | alarms for every pass in `~/.core/passes.conf` (`expect NAME every 1d`) that never ran, failed, timed out, was killed, has been running too long, died mid-run, or is overdue (1.5x its interval); unparseable `passes.conf` lines are alarms too; exit 1 when any |
 | `core overnight` / `core overnight resume NAME` / `core overnight ask NAME` | run the jobs in `~/.core/overnight.conf` that hold a standing permission for their exact command, in legs of ≤5 steps with a check between legs, then put one morning report in the inbox (see below); resume a job paused after 3 failing nights; ask for a job's permission again (e.g. after a no) |
 
@@ -199,9 +201,10 @@ forget it; the next index rebuilds it from your transcripts.
 
 **Optional: the quiet sweep** (`core sweep`) reads Claude Code conversations once they've been idle 30
 minutes and *offers* what's worth remembering — decisions, corrections, durable facts, preferences, open
-loops — through the inbox. It never writes memory itself: every offer quotes the person's own words
+loops — through the inbox. By default it never writes memory itself: every offer quotes the person's own words
 (checked by code, not the model) and the agent saves it only on an explicit yes; a correction that
-contradicts an existing note is offered as "update X → Y". Configure in `~/.core/recall.conf`:
+contradicts an existing note is offered as "update X → Y". With `learn_mode auto` it learns instead of asking
+(see [Learning without asking](#learning-without-asking)). Configure in `~/.core/recall.conf`:
 
 ```
 sweep_model qwen3:8b            # any Ollama model; or a model name with sweep_api below
@@ -212,7 +215,8 @@ sweep_model qwen3:8b            # any Ollama model; or a model name with sweep_a
 # asks_per_day 5               # one daily budget for EVERY ask (sweep, evening, grant proposals, deliver --offer)
 # sweep_shadow on               # log what it would offer to ~/.core/sweep.log, offer nothing
 # sweep_headless on             # also read headless runs (claude -p / Agent SDK). Off by default: their
-                                # "user" turns are an agent's brief, not your words
+                                # "user" turns are an agent's brief, not your words (so even when on, their
+                                # items are only ever offered, never learned silently)
 # sweep_key_file ~/.config/x/key  # API key for a hosted OpenAI-compatible server (a file holding the key,
                                   # or a line like `export X=key`); $SWEEP_API_KEY wins if set. Never logged.
 ```
@@ -270,6 +274,56 @@ yes to core's own offer.
   `corrected` (another correction inside its span), in `offer-outcomes.jsonl`; `core offer stats` shows it per
   skill. "Corrected" means a correction the sweep would capture, so in-the-moment fixes don't count, and a
   conversation is judged when the sweep finishes reading it.
+
+## Learning without asking
+
+Asking before every save gets old: a good assistant learns as it goes and lets you correct it. Add
+`learn_mode auto` to `~/.core/recall.conf` and the sweep saves what it finds to its own file instead of asking,
+with an Undo on everything. The default stays `learn_mode ask` (every memory item is an offer), because silent
+writes should be a choice you make.
+
+```
+learn_mode auto            # default: ask
+# learn_file ~/.core/learned.md   # where learned lines go (default $CORE_HOME/learned.md); refused inside
+                                  # a memory directory recall reads (your curated notes)
+# learn_per_day 10         # silent saves per day; the rest wait for tomorrow
+# learn_budget_kb 24       # over this, the evening pass offers a consolidation
+```
+
+- **The same gates, plus one.** An item is saved only if it passes everything an offer had to: the person's
+  verbatim words (never the assistant's), no maybes or questions, the extractor's own traps, the statement and
+  quote filters, and the novelty judge. In auto mode the judge also decides whether it is *durable* — would a
+  session on a different task, weeks from now, be better for knowing it? Only an explicit yes counts: a one-off
+  ("make this headline one line") or a judge that doesn't say is never saved. Known items are skipped. If the
+  judge can't be reached, nothing is saved on a guess; the item waits for the next run.
+- **Its own file, never yours.** Entries go to `learned.md` (one line each: the statement, your words, date and
+  time, project and `session:line`, type, a stable id). Recall searches it like any memory file. A correction to
+  a line *in* `learned.md` replaces that line (the old text is kept for undo); a correction to one of your own
+  memory files never edits that file — it is saved in `learned.md` marked `supersedes <file>:<line>`.
+- **Undo.** `core learned undo <id>`, or the Undo button on the phone page, removes the entry (or puts back the
+  line it replaced). The same words are never learned again. Hand edits to `learned.md` are fine; undo only
+  touches the line with that id. Once a consolidation (or a hand edit) has rewritten an entry, undo just removes
+  it: the line it once replaced is never brought back, since the rewrite already decided what holds.
+- **It learns from undos.** Each save and undo is a row in `offer-outcomes.jsonl` (source `learned`). A type you
+  undo often (at least 3 times, and at least 30% of its saves) goes back to asking first: those items are offers
+  again. `core offer stats` and the page say so. An entry still standing after 7 days counts in stats as a
+  *soft* positive, labelled as such. **Silence is never permission**: a save is never an "accepted" answer, so
+  it never leads to a standing-permission proposal, and learned lines are notes, not instructions.
+- **One memory question a day, at most.** Core asks about memory only when it genuinely can't decide alone: a
+  correction that would supersede one of your own notes, two of your statements that conflict, or an item the
+  judge can't call durable *and* that would matter a lot if wrong. It asks like a person would ("Quick one: you
+  said “…” on Friday, but your notes say “…”. Which is right now?"), one tap to answer (*What I Said* / *My
+  Notes*; *The Newer One* / *The Earlier One*; *Remember* / *Don't*), and on a yes core writes it to `learned.md`
+  itself. Never more than one a day across every producer (and it uses a slot of `asks_per_day`); when today's is
+  used, a correction is saved as superseding your note (your file untouched) and the other two wait for another
+  day. Everything else is decided silently. Answers to these questions never count toward a standing permission.
+- **What still asks.** Insights, standing permissions (including overnight jobs), skill patches — and a
+  consolidation of `learned.md` when it outgrows `learn_budget_kb` (the evening pass offers it at most once a
+  month, since it rewrites what was learned).
+- **Switching on.** The first sweep in auto mode judges any memory offers still waiting on you under these rules
+  (plain memory offers only, and only when your words are still at the transcript line they cite):
+  durable ones are learned (they show under What I Learned, with Undo); one-offs and things memory already says
+  are quietly retired (`superseded`, not counted as a no).
 
 **Offers, answers and standing permissions.** Sweep and evening results that need a decision arrive as
 *offers*. The agent asks in one line and records the answer with `core offer yes|no|later|never <id>`;
@@ -338,8 +392,8 @@ result down is never the same as the person having seen it.
 as one of core's own producers, so it refuses:
 
 - sources `sweep`, `evening`, `overnight`, `permissions`, `skill` (compared case-blind, lookalike letters folded);
-- keys starting `grant:`, `sweep:`, `insight:`, `evening:`, `overnight:`, `skill:`;
-- tags `grant`, `granted`, `grant_job`, `cmd_sha`, `v`, `patch` — so it can never ask for, or claim, a standing
+- keys starting `grant:`, `sweep:`, `insight:`, `evening:`, `overnight:`, `skill:`, `learned:`;
+- tags `grant`, `granted`, `grant_job`, `cmd_sha`, `v`, `patch`, `question`, `learn` — so it can never ask for, or claim, a standing
   permission, or point an offer at a skill patch;
 - text claiming a pre-approval or standing permission ("Pre-approved…", "Standing permission…", "Sweep offer…",
   "Skill patch offer…").
@@ -356,7 +410,8 @@ fails shows as `` <source> result — open with `core inbox` ``; `core inbox`, r
 This includes `brief --deliver` audit lines and the job output quoted under DONE TODAY.
 
 **Recall sources:** `~/.core` ledgers always; plus every `memory_dir <path>` line in
-`~/.core/recall.conf`, defaulting to each `~/.claude/projects/*/memory` directory.
+`~/.core/recall.conf`, defaulting to each `~/.claude/projects/*/memory` directory; plus `learned.md` (see
+Learning without asking) when it exists.
 
 ## Asks: one budget a day
 
@@ -404,6 +459,76 @@ Everything on it already lives in `~/.core` (inbox, `heartbeat.json`, `passes.co
 if it disappears nothing is lost. An empty home says `Nothing needs you.` A job that failed, hung or is
 overdue replaces the healthy footer with a `!` line under the header. Acknowledging an item anywhere
 removes it here.
+
+## The phone page
+
+`core serve` serves the home screen as a private page for your phone: the same data as `core home`, with
+**Yes · Later · No · Never** buttons on each offer. With `learn_mode auto` it opens with **What I Learned** (today,
+then earlier this week): each entry in your terms ("You prefer…"), your words, when and where you said them, and
+an **Undo** button (it does exactly what `core learned undo` does, with the same nonce check as answers). **Needs
+You** below it holds only real asks. The headline says both: "Learned 4 things today. One thing needs you."
+
+```
+core serve            # prints: core serve: open http://100.x.y.z:8796/<token>/
+core serve --url      # print the URL and exit
+core serve --local    # 127.0.0.1 only, even when Tailscale is up
+```
+
+- **Where it listens.** This Mac's Tailscale address when Tailscale holds one (`tailscale ip -4`), otherwise
+  127.0.0.1. Never `0.0.0.0`: anything else is refused. If the address changes, the server exits so launchd
+  restarts it on the new one. Install Tailscale on the phone and open the URL there; nothing goes through a
+  third party's servers.
+- **The token.** A random secret in `~/.core/serve.token` (0600) is the first path segment. Without it every
+  request is a bare 404 with no body. Request lines are never logged. Delete the file to rotate it. A request
+  naming any other host than the address it listens on (or `localhost`, when local) is refused, as is a post
+  another site makes (`Sec-Fetch-Site: cross-site` or a foreign `Origin`). Each connection has its own thread and
+  3 seconds to speak, so a stalled one never holds up the page.
+- **Answers.** A tap records exactly what `core offer <answer> <id>` records (it is the same code: same lock,
+  same `offer-outcomes.jsonl` row). A form post also needs a nonce from a page this server rendered, so another
+  site can't post one, and a page from before a restart asks you to reload. It works with JavaScript off
+  (plain form posts); with JavaScript the answered offer slides out and a quiet "Recorded" line appears.
+- **What the phone can't answer.** Standing-permission proposals, overnight job permissions, skill patches and
+  consolidating learned memory are shown but say *Answer On Your Mac*: a grant needs your own words (`--note`), a patch needs its diff read, a consolidation rewrites a file in a session with you.
+  Offers whose text fails the display filters show a pointer to `core inbox`, never the raw text.
+- **The page itself.** One file, inline CSS and JS, no outside requests (a strict Content-Security-Policy says
+  so). Type is Iowan Old Style for what was said and Avenir Next for everything else, both built into iOS and
+  macOS, so nothing is downloaded. Light and dark follow the phone; reduced motion is respected.
+
+Run it under launchd (not installed for you). Save as `~/Library/LaunchAgents/local.core.serve.plist`, fix the
+paths, then `launchctl load` it:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.core.serve</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string><string>/Users/you/code/cognitive-core/bin/core</string><string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/Applications/Tailscale.app/Contents/MacOS:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <!-- the URL (with its token) is printed here: keep it inside ~/.core -->
+  <key>StandardOutPath</key><string>/Users/you/.core/serve.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/.core/serve.log</string>
+</dict></plist>
+```
+
+The page only loads while the Mac is awake and on the tailnet.
+
+**The doorbell.** Add `notify_cmd` to `~/.core/recall.conf` to be pinged when one of core's own producers (sweep,
+evening, permissions, skill) puts a new question to you:
+
+```
+notify_cmd /path/to/your-notifier --title     # gets one more argument: "<name>: 1 new"
+```
+
+The message never carries the offer's text, source or id, only a count. It rings at most once an hour; asks
+that land inside the hour are counted into the next ping. Reports and `core deliver` from external jobs never
+ring it. Without the line nothing runs.
 
 ## Identity
 
